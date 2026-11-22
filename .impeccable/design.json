@@ -1,0 +1,517 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-22T05:54:32+00:00",
+  "title": "Design System: dev-english",
+  "extensions": {
+    "colorMeta": {
+      "subtitle-yellow": {
+        "role": "primary",
+        "displayName": "Subtitle Yellow",
+        "canonical": "#FFE14D",
+        "cssVar": "--sub",
+        "tonalRamp": [
+          "#140900",
+          "#322100",
+          "#543D00",
+          "#785A00",
+          "#997B00",
+          "#BB9D00",
+          "#DCC451",
+          "#FFF0A0"
+        ]
+      },
+      "subtitle-yellow-hover": {
+        "role": "primary",
+        "displayName": "Lit Subtitle",
+        "canonical": "#FFE96F",
+        "tonalRamp": [
+          "#140900",
+          "#322100",
+          "#543D00",
+          "#785A00",
+          "#997B00",
+          "#BB9D00",
+          "#DCC451",
+          "#FFF0A0"
+        ]
+      },
+      "subtitle-ink": {
+        "role": "primary",
+        "displayName": "Subtitle Ink",
+        "canonical": "#141205",
+        "cssVar": "--sub-ink",
+        "tonalRamp": [
+          "#0C0B06",
+          "#26241B",
+          "#424034",
+          "#605E4E",
+          "#807E6D",
+          "#A19F8D",
+          "#C7C5B5",
+          "#F0EFE3"
+        ]
+      },
+      "subtitle-wash": {
+        "role": "primary",
+        "displayName": "Subtitle Wash",
+        "canonical": "rgba(255, 225, 77, .12)",
+        "cssVar": "--sub-soft"
+      },
+      "screening-black": {
+        "role": "neutral",
+        "displayName": "Screening Black",
+        "canonical": "#0B0B0C",
+        "cssVar": "--ground",
+        "tonalRamp": [
+          "#0B0B0B",
+          "#242425",
+          "#404041",
+          "#5D5D5F",
+          "#7D7D7E",
+          "#9E9EA0",
+          "#C4C4C5",
+          "#EEEEEF"
+        ]
+      },
+      "scene-surface": {
+        "role": "neutral",
+        "displayName": "Scene Surface",
+        "canonical": "#141519",
+        "cssVar": "--surface",
+        "tonalRamp": [
+          "#0B0B0D",
+          "#232427",
+          "#3E3F43",
+          "#5C5D62",
+          "#7C7D82",
+          "#9D9EA4",
+          "#C3C4C9",
+          "#EDEEF2"
+        ]
+      },
+      "scene-surface-raised": {
+        "role": "neutral",
+        "displayName": "Scene Surface Raised",
+        "canonical": "#1C1E23",
+        "cssVar": "--surface-2",
+        "tonalRamp": [
+          "#0A0B0D",
+          "#232427",
+          "#3E4044",
+          "#5B5D63",
+          "#7B7D83",
+          "#9C9EA5",
+          "#C2C4CA",
+          "#EDEEF3"
+        ]
+      },
+      "scene-surface-high": {
+        "role": "neutral",
+        "displayName": "Scene Surface High",
+        "canonical": "#25282E",
+        "cssVar": "--surface-3",
+        "tonalRamp": [
+          "#0A0B0D",
+          "#222428",
+          "#3D4045",
+          "#5A5E65",
+          "#7A7D85",
+          "#9B9EA6",
+          "#C1C4CB",
+          "#ECEEF4"
+        ]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#2A2D33",
+        "cssVar": "--line",
+        "tonalRamp": [
+          "#0A0B0D",
+          "#222428",
+          "#3D4045",
+          "#5A5E64",
+          "#7A7D84",
+          "#9B9EA6",
+          "#C1C4CB",
+          "#ECEEF3"
+        ]
+      },
+      "hairline-strong": {
+        "role": "neutral",
+        "displayName": "Hairline Strong",
+        "canonical": "#3A3E46",
+        "cssVar": "--line-2",
+        "tonalRamp": [
+          "#0A0B0E",
+          "#222429",
+          "#3C4046",
+          "#595E66",
+          "#797D86",
+          "#9A9EA8",
+          "#C0C4CC",
+          "#EBEEF5"
+        ]
+      },
+      "screen-white": {
+        "role": "neutral",
+        "displayName": "Screen White",
+        "canonical": "#F5F5F5",
+        "cssVar": "--text",
+        "tonalRamp": [
+          "#0B0B0B",
+          "#242424",
+          "#404040",
+          "#5D5D5D",
+          "#7D7D7D",
+          "#9E9E9E",
+          "#C4C4C4",
+          "#EEEEEE"
+        ]
+      },
+      "muted-grey": {
+        "role": "neutral",
+        "displayName": "Muted Grey",
+        "canonical": "#A3A7B0",
+        "cssVar": "--muted",
+        "tonalRamp": [
+          "#0A0B0E",
+          "#222428",
+          "#3D4046",
+          "#5A5E66",
+          "#797D86",
+          "#9A9EA7",
+          "#C1C4CC",
+          "#ECEEF4"
+        ]
+      },
+      "faint-grey": {
+        "role": "neutral",
+        "displayName": "Faint Grey",
+        "canonical": "#7D828C",
+        "cssVar": "--faint",
+        "tonalRamp": [
+          "#0A0B0E",
+          "#212429",
+          "#3C4047",
+          "#595E67",
+          "#787D87",
+          "#999FA9",
+          "#C0C4CD",
+          "#EBEFF5"
+        ]
+      },
+      "recording-red": {
+        "role": "state",
+        "displayName": "Recording Red",
+        "canonical": "#E5484D",
+        "cssVar": "--rec",
+        "tonalRamp": [
+          "#250000",
+          "#500003",
+          "#7F0011",
+          "#B10122",
+          "#D83B43",
+          "#FF6263",
+          "#FF9692",
+          "#FFCFC9"
+        ]
+      },
+      "recording-red-text": {
+        "role": "state",
+        "displayName": "Recording Red Text",
+        "canonical": "#FF8A8D",
+        "tonalRamp": [
+          "#250000",
+          "#500003",
+          "#7F0011",
+          "#B10122",
+          "#D83B43",
+          "#FF6263",
+          "#FF9692",
+          "#FFCFC9"
+        ]
+      },
+      "success-green": {
+        "role": "state",
+        "displayName": "Success Green",
+        "canonical": "#3DD68C",
+        "cssVar": "--ok",
+        "tonalRamp": [
+          "#001301",
+          "#00310C",
+          "#00531F",
+          "#007734",
+          "#009953",
+          "#02BC74",
+          "#6DDFA0",
+          "#B4FFD4"
+        ]
+      },
+      "warning-orange": {
+        "role": "state",
+        "displayName": "Warning Orange",
+        "canonical": "#FF9F43",
+        "cssVar": "--warn",
+        "tonalRamp": [
+          "#1E0200",
+          "#431200",
+          "#6C2900",
+          "#984100",
+          "#BC6200",
+          "#E2841F",
+          "#FFB069",
+          "#FFE0AD"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Retell countdown timer only."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Page and episode titles; 1.728rem under 720px."
+      },
+      "subtitle-line": {
+        "displayName": "Subtitle Line",
+        "purpose": "The partner's current line on the stage, yellow, centred, max 32em."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Section headings; score values at 800."
+      },
+      "title-sm": {
+        "displayName": "Title Sm",
+        "purpose": "Panel headings, wordmark, phrase text, training reveal."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default copy, prose capped at 68-70ch."
+      },
+      "body-sm": {
+        "displayName": "Body Sm",
+        "purpose": "Descriptions, metrics, tables; buttons at 600, nav at 500."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Pills, caption toggle, hints, small labels."
+      },
+      "label-caps": {
+        "displayName": "Label Caps",
+        "purpose": "Briefing definition terms and table headers only."
+      }
+    },
+    "shadows": [
+      {
+        "name": "float",
+        "value": "0 8px 24px rgba(0, 0, 0, .35)",
+        "purpose": "Toast."
+      },
+      {
+        "name": "drawer",
+        "value": "-12px 0 32px rgba(0, 0, 0, .45)",
+        "purpose": "Briefing drawer left edge."
+      },
+      {
+        "name": "mic-lift",
+        "value": "0 6px 16px rgba(0, 0, 0, .45)",
+        "purpose": "Resting microphone."
+      },
+      {
+        "name": "recording-pulse",
+        "value": "0 0 0 16px rgba(229, 72, 77, 0)",
+        "purpose": "Ring keyframe on the recording mic, 1.4s infinite, from 0 0 0 0 rgba(229, 72, 77, .5)."
+      },
+      {
+        "name": "stage-vignette",
+        "value": "inset 0 0 120px rgba(0, 0, 0, .55)",
+        "purpose": "Inside every stage."
+      },
+      {
+        "name": "focus-halo",
+        "value": "0 0 0 3px rgba(255, 225, 77, .12)",
+        "purpose": "Input focus."
+      },
+      {
+        "name": "subtitle-legibility",
+        "value": "0 2px 4px rgba(0, 0, 0, .9), 0 0 18px rgba(0, 0, 0, .6)",
+        "purpose": "text-shadow on the subtitle line over the stage."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-house",
+        "value": "cubic-bezier(.16, 1, .3, 1)",
+        "purpose": "All transitions and the drawer slide."
+      },
+      {
+        "name": "duration-state",
+        "value": "180ms",
+        "purpose": "Hover, focus, press, blur reveal."
+      },
+      {
+        "name": "duration-drawer",
+        "value": "240ms",
+        "purpose": "Briefing drawer slide."
+      },
+      {
+        "name": "pulse-recording",
+        "value": "1.4s infinite",
+        "purpose": "Recording mic ring."
+      },
+      {
+        "name": "shimmer",
+        "value": "1.4s infinite linear",
+        "purpose": "Skeleton loading."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "0.01ms",
+        "purpose": "All animation and transition durations under prefers-reduced-motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "stack",
+        "value": "900px",
+        "purpose": "Splits collapse to one column; sidebar unsticks."
+      },
+      {
+        "name": "mobile",
+        "value": "720px",
+        "purpose": "Top bar wraps, icon-only nav, 16px gutters, controls stack."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one yellow action per view (e.g. Falar agora).",
+      "html": "<button class=\"ds-btn-primary\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"9\" y=\"2\" width=\"6\" height=\"12\" rx=\"3\"/><path d=\"M19 10v1a7 7 0 0 1-14 0v-1M12 18v4\"/></svg> Falar agora</button>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-btn-primary{display:inline-flex;align-items:center;gap:8px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;font-weight:600;font-size:.875rem;padding:10px 16px;border-radius:10px;border:1px solid var(--line-2);cursor:pointer;transition:background var(--t),border-color var(--t),transform var(--t),color var(--t);background:var(--sub);border-color:var(--sub);color:var(--sub-ink);} .ds-btn-primary:hover{background:#FFE96F;border-color:#FFE96F;} .ds-btn-primary:active{transform:translateY(1px);} .ds-btn-primary:focus-visible{outline:2px solid var(--sub);outline-offset:2px;}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Default action on a raised surface.",
+      "html": "<button class=\"ds-btn\">Encerrar e ver feedback</button>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-btn{display:inline-flex;align-items:center;gap:8px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;font-weight:600;font-size:.875rem;padding:10px 16px;border-radius:10px;border:1px solid var(--line-2);cursor:pointer;transition:background var(--t),border-color var(--t),transform var(--t),color var(--t);background:var(--surface-2);color:var(--text);} .ds-btn:hover{background:var(--surface-3);border-color:var(--faint);} .ds-btn:active{transform:translateY(1px);} .ds-btn:focus-visible{outline:2px solid var(--sub);outline-offset:2px;}"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Low-emphasis action beside a primary.",
+      "html": "<button class=\"ds-btn-ghost\">Ouvir de novo</button>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-btn-ghost{display:inline-flex;align-items:center;gap:8px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;font-weight:600;font-size:.875rem;padding:10px 16px;border-radius:10px;border:1px solid var(--line-2);cursor:pointer;transition:background var(--t),border-color var(--t),transform var(--t),color var(--t);background:transparent;border-color:transparent;color:var(--muted);} .ds-btn-ghost:hover{background:var(--surface-2);color:var(--text);} .ds-btn-ghost:focus-visible{outline:2px solid var(--sub);outline-offset:2px;}"
+    },
+    {
+      "name": "Microphone",
+      "kind": "custom",
+      "refersTo": "mic-button",
+      "description": "Signature 76px push-to-talk circle; red with an expanding ring while recording.",
+      "html": "<div class=\"ds-mic-row\"><button class=\"ds-mic\" aria-label=\"Falar\"><svg width=\"30\" height=\"30\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"9\" y=\"2\" width=\"6\" height=\"12\" rx=\"3\"/><path d=\"M19 10v1a7 7 0 0 1-14 0v-1M12 18v4\"/></svg></button><button class=\"ds-mic ds-rec\" aria-label=\"Gravando\"><svg width=\"30\" height=\"30\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"9\" y=\"2\" width=\"6\" height=\"12\" rx=\"3\"/><path d=\"M19 10v1a7 7 0 0 1-14 0v-1M12 18v4\"/></svg></button></div>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-mic-row{display:flex;gap:24px;padding:24px;background:var(--ground);} .ds-mic{width:76px;height:76px;border-radius:50%;border:0;background:var(--sub);color:var(--sub-ink);display:grid;place-items:center;cursor:pointer;box-shadow:0 6px 16px rgba(0,0,0,.45);transition:transform var(--t),background var(--t);} .ds-mic:hover{transform:scale(1.04);} .ds-mic:focus-visible{outline:2px solid var(--sub);outline-offset:2px;} .ds-rec{background:var(--rec);color:#fff;animation:ds-rec 1.4s infinite;} @keyframes ds-rec{0%{box-shadow:0 0 0 0 rgba(229,72,77,.5);}70%{box-shadow:0 0 0 16px rgba(229,72,77,0);}100%{box-shadow:0 0 0 0 rgba(229,72,77,0);}}"
+    },
+    {
+      "name": "Stage with Subtitle",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "Signature radial-lit, vignetted scene: lower-third, caption toggle, yellow subtitle line.",
+      "html": "<div class=\"ds-stage\"><div class=\"ds-bar\"><div class=\"ds-lt\"><span class=\"ds-av\">M</span><span><b>Maya</b><br><small>Tech lead</small></span></div><div class=\"ds-seg\"><button aria-pressed=\"false\">Sem legenda</button><button aria-pressed=\"true\">Clique para ver</button><button aria-pressed=\"false\">Sempre</button></div></div><p class=\"ds-sub\">So, what was blocking the deploy yesterday?</p></div>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-stage{position:relative;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;color:var(--text);min-height:280px;display:flex;flex-direction:column;justify-content:space-between;padding:22px 26px;border-radius:16px;overflow:hidden;border:1px solid var(--line);background:radial-gradient(120% 90% at 25% 20%,#2D323A 0%,#181A1E 55%,#0F1012 100%);box-shadow:inset 0 0 120px rgba(0,0,0,.55);} .ds-bar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;} .ds-lt{display:flex;align-items:center;gap:12px;} .ds-lt small{color:var(--muted);font-size:.875rem;} .ds-av{width:44px;height:44px;border-radius:50%;background:var(--surface-3);border:1px solid var(--line-2);display:grid;place-items:center;font-weight:800;} .ds-seg{display:inline-flex;background:var(--surface);border:1px solid var(--line);border-radius:99px;padding:3px;} .ds-seg button{font:inherit;font-size:.75rem;font-weight:600;border:0;background:transparent;color:var(--muted);padding:6px 12px;border-radius:99px;cursor:pointer;transition:background var(--t),color var(--t);} .ds-seg button:hover{color:var(--text);} .ds-seg button[aria-pressed=true]{background:var(--sub);color:var(--sub-ink);} .ds-seg button:focus-visible{outline:2px solid var(--sub);outline-offset:2px;} .ds-sub{margin:0;color:var(--sub);font-weight:600;font-size:clamp(1.5rem,2.4vw,2.125rem);line-height:1.32;text-align:center;text-wrap:balance;text-shadow:0 2px 4px rgba(0,0,0,.9),0 0 18px rgba(0,0,0,.6);}"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input-text",
+      "description": "Field on Scene Surface; yellow border and wash halo on focus.",
+      "html": "<label class=\"ds-field\">Cargo desejado<input class=\"ds-input\" type=\"text\" placeholder=\"Senior backend engineer\"></label>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-field{display:flex;flex-direction:column;gap:6px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;font-size:.875rem;color:var(--muted);} .ds-input{font:inherit;font-size:1rem;color:var(--text);background:var(--surface);border:1px solid var(--line-2);border-radius:10px;padding:10px 12px;transition:border-color var(--t),box-shadow var(--t);} .ds-input::placeholder{color:var(--faint);} .ds-input:focus,.ds-input:focus-visible{outline:none;border-color:var(--sub);box-shadow:0 0 0 3px var(--sub-soft);}"
+    },
+    {
+      "name": "Top Navigation",
+      "kind": "nav",
+      "refersTo": "nav-link",
+      "description": "Sticky blurred bar: yellow wordmark, muted links, status dot.",
+      "html": "<header class=\"ds-top\"><a class=\"ds-brand\" href=\"#\"><span class=\"ds-mark\"></span>dev-english</a><nav><a href=\"#\" class=\"ds-active\">Praticar</a><a href=\"#\">Minhas frases</a><a href=\"#\">Histórico</a></nav><span class=\"ds-status\">pronto</span></header>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-top{display:flex;align-items:center;gap:28px;height:64px;padding:0 32px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;background:rgba(11,11,12,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);} .ds-brand{display:flex;align-items:center;gap:10px;color:var(--text);text-decoration:none;font-weight:800;font-size:1.2rem;letter-spacing:-.02em;} .ds-mark{width:30px;height:30px;border-radius:8px;background:var(--sub);} .ds-top nav{display:flex;gap:4px;} .ds-top nav a{color:var(--muted);text-decoration:none;font-weight:500;font-size:.875rem;padding:8px 12px;border-radius:8px;transition:color var(--t),background var(--t);} .ds-top nav a:hover,.ds-top nav a.ds-active{color:var(--text);background:var(--surface-2);} .ds-top a:focus-visible{outline:2px solid var(--sub);outline-offset:2px;} .ds-status{margin-left:auto;display:inline-flex;align-items:center;gap:8px;font-size:.75rem;color:var(--faint);} .ds-status::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--ok);}"
+    },
+    {
+      "name": "Pills",
+      "kind": "chip",
+      "refersTo": "pill",
+      "description": "Capsule labels; colour only for accent or state.",
+      "html": "<div class=\"ds-pills\"><span class=\"ds-pill\">142 palavras/min</span><span class=\"ds-pill ds-sub\">Clássico</span><span class=\"ds-pill ds-ok\">frase usada</span><span class=\"ds-pill ds-warn\">sob pressão</span><span class=\"ds-pill ds-recp\">impacto alto</span></div>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-pills{display:flex;gap:6px;flex-wrap:wrap;padding:16px;background:var(--surface);} .ds-pill{display:inline-flex;align-items:center;gap:6px;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;font-size:.75rem;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--surface-3);color:var(--muted);} .ds-sub{background:var(--sub-soft);color:var(--sub);} .ds-ok{background:rgba(61,214,140,.12);color:var(--ok);} .ds-warn{background:rgba(255,159,67,.12);color:var(--warn);} .ds-recp{background:rgba(229,72,77,.14);color:#FF8A8D;}"
+    },
+    {
+      "name": "Row List",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "One hairline-divided container of entry rows with yellow icon wells.",
+      "html": "<nav class=\"ds-rows\"><a class=\"ds-row\" href=\"#\"><span class=\"ds-well\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 2l1.9 1.9M16 2l-1.9 1.9M9 7.1V6a3 3 0 1 1 6 0v1.1\"/><path d=\"M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6zM12 20v-9M6 13H2M22 13h-4\"/></svg></span><span class=\"ds-b\"><b>Situação de trabalho</b><small>Relatar bug, bloqueio, atraso, incidente…</small></span><span class=\"ds-chev\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m9 18 6-6-6-6\"/></svg></span></a><a class=\"ds-row\" href=\"#\"><span class=\"ds-well\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 2l1.9 1.9M16 2l-1.9 1.9M9 7.1V6a3 3 0 1 1 6 0v1.1\"/><path d=\"M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6zM12 20v-9M6 13H2M22 13h-4\"/></svg></span><span class=\"ds-b\"><b>Entrevista para uma vaga real</b><small>O entrevistador lê seu perfil.</small></span><span class=\"ds-chev\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m9 18 6-6-6-6\"/></svg></span></a></nav>",
+      "css": ":host{--sub:#FFE14D;--sub-ink:#141205;--sub-soft:rgba(255,225,77,.12);--ground:#0B0B0C;--surface:#141519;--surface-2:#1C1E23;--surface-3:#25282E;--line:#2A2D33;--line-2:#3A3E46;--text:#F5F5F5;--muted:#A3A7B0;--faint:#7D828C;--rec:#E5484D;--ok:#3DD68C;--warn:#FF9F43;--t:180ms cubic-bezier(.16, 1, .3, 1);} .ds-rows{display:block;font-family:Figtree,ui-sans-serif,system-ui,sans-serif;border:1px solid var(--line);border-radius:16px;background:var(--surface);overflow:hidden;} .ds-row+.ds-row{border-top:1px solid var(--line);} .ds-row{display:flex;align-items:center;gap:16px;padding:16px 20px;color:var(--text);text-decoration:none;transition:background var(--t);} .ds-row:hover{background:var(--surface-2);} .ds-row:focus-visible{outline:2px solid var(--sub);outline-offset:-2px;} .ds-well{width:40px;height:40px;border-radius:10px;background:var(--surface-3);color:var(--sub);display:grid;place-items:center;flex:none;} .ds-b{flex:1;min-width:0;} .ds-b b{display:block;font-weight:700;} .ds-b small{display:block;color:var(--muted);font-size:.875rem;margin-top:2px;} .ds-chev{color:var(--faint);display:grid;transition:color var(--t);} .ds-row:hover .ds-chev{color:var(--sub);}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Subtitled Episode",
+    "overview": "Practice is a scene from a subtitled series, the way Brazil learned English. Every screen sits in a screening room: a near-black ground, scene surfaces graded a few steps lighter, hairlines instead of shadows, and one colour that belongs to the subtitle. The partner speaks on a dark stage; their words arrive at the base of the frame as a yellow subtitle the learner can switch off, reveal on demand, or keep on. The yellow is also what you press: the primary action, the microphone, the selection highlight. Anything else that carries colour is reporting state (recording, success, warning), never decorating.\n\nDensity is calm and desk-shaped: a 1180px column, generous 40px section breaks, rows and panels rather than card mosaics. The conversation screen is the focus of the whole product and gets the largest type in the system: the live subtitle line. The voice is a coach, not a game: no mascots, no confetti palette, no streak theatrics.\n\nThe world explicitly rejects the category default for language apps: white rounded cards, a chat-bubble column, and a gamified mascot palette.",
+    "keyCharacteristics": [
+      "Screening-room dark only (`color-scheme: dark`); no light theme.",
+      "One accent, subtitle yellow, for action, the mic, selection and the live subtitle.",
+      "Red, green and orange appear only as state.",
+      "One family, Figtree 400 to 800, on a 1.2 type scale.",
+      "Lucide-style 1.75px line icons, inline SVG, `currentColor`.",
+      "Depth by tonal grading and hairlines; shadow only on things that float.",
+      "The stage: a radial-lit, vignetted frame with a lower-third and a subtitle line."
+    ],
+    "rules": [
+      {
+        "name": "The One Subtitle Rule",
+        "body": "Subtitle Yellow is the only accent, and it means either \"this is the line\" or \"press this\". If a yellow element is neither, it should be grey.",
+        "section": "colors"
+      },
+      {
+        "name": "The State-Only Rule",
+        "body": "Red, green and orange never decorate. They appear only when they report a state: recording, offline, correct, improved, unclear, under pressure.",
+        "section": "colors"
+      },
+      {
+        "name": "The Subtitle Is Biggest Rule",
+        "body": "On the conversation screen nothing outsizes the subtitle line. Chrome stays at Body Small or below so the line reads first.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Numbers Rule",
+        "body": "Every number that changes or is compared (scores, timers, metrics, table numerics) uses tabular figures.",
+        "section": "typography"
+      },
+      {
+        "name": "The Hairline-First Rule",
+        "body": "Containers are separated by a 1px hairline and a tonal step, never by a drop shadow. A shadow means \"this floats\" (toast, drawer, mic).",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** keep Subtitle Yellow (#FFE14D) to the line and the action: one yellow primary button per view, the mic, the active caption mode, focus and selection.",
+      "**Do** separate surfaces with a 1px hairline (#2A2D33) and one tonal step rather than a shadow.",
+      "**Do** put the partner's words on a stage as a centred yellow subtitle line, and respect the learner's caption mode (off, reveal-on-click with blur, always).",
+      "**Do** use inline 1.75px-stroke line icons in `currentColor`, sized 1.15em.",
+      "**Do** animate state changes at 180ms `cubic-bezier(.16, 1, .3, 1)` and honour `prefers-reduced-motion`.",
+      "**Do** use tabular figures for every score, timer and metric."
+    ],
+    "donts": [
+      "**Don't** introduce a light theme, white rounded cards, or a chat-bubble column for the conversation.",
+      "**Don't** add a gamified mascot palette: red, green and orange (#E5484D, #3DD68C, #FF9F43) appear only as state, never as decoration or category colour.",
+      "**Don't** add a second accent hue or a second type family.",
+      "**Don't** put Recording Red (#E5484D) directly on text; use the readable tint (#FF8A8D).",
+      "**Don't** let any chrome on the conversation screen outsize the subtitle line."
+    ]
+  }
+}
