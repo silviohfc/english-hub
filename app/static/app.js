@@ -37,11 +37,16 @@ const settings = {
   get cc() { return store.get("cc", LEGACY_CC[store.get("textMode", "")] || "reveal"); },
 };
 
+const fmtSec = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : "");
 const fmtDay = (iso) => (iso ? new Date(iso).toLocaleDateString("pt-BR", { day: "2-digit", month: "short" }) : "");
 const pct = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
 const dash = (x) => (x == null || x === "" ? "–" : x);
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const VOICES = ["af_heart", "af_bella", "af_nicole", "am_michael", "am_adam", "am_puck", "am_eric", "bf_emma", "bm_george", "bm_lewis"];
+// Portrait for a voice (photos in /static/avatars, see CREDITS.md); falls back to the initial if missing.
+const avatar = (voice, name, cls = "") => `<span class="avatar ${cls}">${initial(name)}${VOICES.includes(voice)
+  ? `<img src="/static/avatars/${voice}.jpg" alt="" loading="lazy" onerror="this.remove()">` : ""}</span>`;
 const initial = (name) => esc((name || "?").trim().charAt(0).toUpperCase());
 
 // =====================================================================
@@ -49,6 +54,7 @@ const initial = (name) => esc((name || "?").trim().charAt(0).toUpperCase());
 // =====================================================================
 const ICONS = {
   mic: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>',
+  micOff: '<path d="m2 2 20 20"/><path d="M18.9 13.2A7 7 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.3V5a3 3 0 0 0-5.7-1.3"/><path d="M9 9v3a3 3 0 0 0 5.1 2.1"/><path d="M12 19v3"/>',
   square: '<rect width="12" height="12" x="6" y="6" rx="2"/>',
   volume: '<path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>',
   star: '<path d="m12 2 3.1 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.8 21l1.2-6.8-5-4.9 6.9-1Z"/>',
@@ -93,13 +99,52 @@ const PACK_ICONS = { daily: "clock", bugs: "bug", review: "pr", interview: "brie
 let currentAudio = null;
 function stopAudio() { if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
 
+// Live audio level (0..1) from any audio node, like the speaking indicator of meeting apps.
+let actx = null;
+function audioCtx() {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === "suspended") actx.resume().catch(() => {});
+  return actx;
+}
+function meter(node, onLevel) {
+  const an = audioCtx().createAnalyser();
+  an.fftSize = 512;
+  node.connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  let raf = 0, smooth = 0;
+  const tick = () => {
+    an.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (const v of buf) { const x = (v - 128) / 128; sum += x * x; }
+    const lvl = Math.min(1, Math.sqrt(sum / buf.length) * 5);
+    smooth = lvl > smooth ? lvl : smooth * 0.85 + lvl * 0.15;
+    onLevel(smooth);
+    raf = requestAnimationFrame(tick);
+  };
+  tick();
+  return () => { cancelAnimationFrame(raf); onLevel(0); try { node.disconnect(an); } catch { /* ignore */ } };
+}
+let speakLevel = null; // set by the call screen to animate the partner's portrait
+
 async function speak(text, voice) {
   stopAudio();
   const blob = await api("/api/tts", { json: { text, voice, speed: settings.speed } });
   const audio = new Audio(URL.createObjectURL(blob));
   currentAudio = audio;
+  let stopMeter = null;
+  // Route through the meter only when the audio context is already running; otherwise the voice would be muted.
+  if (speakLevel && audioCtx().state === "running") {
+    try {
+      const src = audioCtx().createMediaElementSource(audio);
+      src.connect(audioCtx().destination);
+      stopMeter = meter(src, speakLevel);
+    } catch { /* metering is optional */ }
+  }
   await audio.play().catch(() => {});
-  return new Promise((r) => { audio.onended = r; audio.onpause = r; });
+  return new Promise((r) => {
+    const done = () => { stopMeter?.(); r(); };
+    audio.onended = done; audio.onpause = done;
+  });
 }
 
 class Recorder {
@@ -111,12 +156,16 @@ class Recorder {
     this.rec.ondataavailable = (e) => e.data.size && this.chunks.push(e.data);
     this.rec.start();
     this.startedAt = Date.now();
+    if (this.onLevel) {
+      try { this.stopMeter = meter(audioCtx().createMediaStreamSource(this.stream), this.onLevel); } catch { /* optional */ }
+    }
   }
   get active() { return this.rec?.state === "recording"; }
   stop() {
     return new Promise((resolve) => {
       if (!this.active) return resolve(null);
       this.rec.onstop = () => {
+        this.stopMeter?.(); this.stopMeter = null;
         this.stream.getTracks().forEach((t) => t.stop());
         resolve(new Blob(this.chunks, { type: "audio/webm" }));
       };
@@ -241,7 +290,7 @@ let pendingScenario = null;
 async function startScenario(id) {
   if (String(id).startsWith("c")) {
     const c = await api("/api/custom/" + String(id).slice(1));
-    pendingScenario = { id, title_pt: c.title_pt, title: c.title, persona: c.persona?.name, role: c.persona?.role, briefing: c };
+    pendingScenario = { id, title_pt: c.title_pt, title: c.title, persona: c.persona?.name, role: c.persona?.role, voice: c.persona?.voice, briefing: c };
   } else {
     const s = (await scenariosList()).find((x) => x.id === id);
     pendingScenario = { ...s, role: s.title };
@@ -257,15 +306,15 @@ async function renderHome() {
   const [scs, custom, profile, ph] = await Promise.all([scenariosList(), api("/api/custom"), api("/api/profile"), api("/api/phrases")]);
   const fresh = custom.find((c) => !c.plays) || custom[0];
   const next = fresh
-    ? { id: "c" + fresh.id, title: fresh.title, desc: fresh.desc_pt, persona: fresh.persona, tag: fresh.source?.label || "Cenário salvo" }
-    : { id: scs[0].id, title: scs[0].title_pt, desc: scs[0].desc_pt, persona: scs[0].persona, tag: "Clássico" };
+    ? { id: "c" + fresh.id, title: fresh.title, desc: fresh.desc_pt, persona: fresh.persona, voice: fresh.voice, tag: fresh.source?.label || "Cenário salvo" }
+    : { id: scs[0].id, title: scs[0].title_pt, desc: scs[0].desc_pt, persona: scs[0].persona, voice: scs[0].voice, tag: "Clássico" };
 
   view.innerHTML = `
   <div class="home-grid">
     <div>
       <section class="stage hero" aria-labelledby="next-title">
         <div class="top-line">
-          <span class="lower-third"><span class="avatar">${initial(next.persona)}</span>
+          <span class="lower-third">${avatar(next.voice, next.persona, "lg")}
             <span><span class="name">${esc(next.persona)}</span><br><span class="role">Próxima cena · ${esc(next.tag)}</span></span></span>
         </div>
         <div class="copy">
@@ -399,12 +448,12 @@ async function renderClassics() {
   view.innerHTML = pageHead("Conversas clássicas e cenários salvos", "", ["#home", "Praticar"]) + `
     <h2 style="margin-bottom:14px">Clássicas</h2>
     <nav class="rows">${scs.map((s) => `<button class="row-item" data-start="${s.id}">
-      <span class="avatar">${initial(s.persona)}</span>
+      ${avatar(s.voice, s.persona)}
       <span class="body"><span class="title">${esc(s.title_pt)}</span><span class="desc">${esc(s.persona)} · ${esc(s.desc_pt)}</span></span>
       ${ic("mic", "chev")}</button>`).join("")}</nav>
     <section class="section"><h2>Cenários salvos</h2>
       ${custom.length ? `<div class="rows">${custom.map((c) => `<div class="row-item row-static">
-        <span class="avatar">${initial(c.persona)}</span>
+        ${avatar(c.voice, c.persona)}
         <a class="body" href="#brief/${c.id}" style="color:inherit;text-decoration:none"><span class="title">${esc(c.title)}</span>
           <span class="desc">${esc(c.source?.label || c.kind)}${c.source?.company ? " · " + esc(c.source.company) : ""} · com ${esc(c.persona)}</span></a>
         <span class="meta">${c.plays ? `${c.plays}× praticado` : "nunca praticado"}</span>
@@ -448,7 +497,7 @@ async function renderBrief(id) {
     <div class="split">
       <div class="panel">${briefHTML(c)}</div>
       <aside class="stack sticky">
-        <div class="panel"><div class="lower-third"><span class="avatar">${initial(who.name)}</span>
+        <div class="panel"><div class="lower-third">${avatar(who.voice, who.name, "lg")}
           <span><span class="name">${esc(who.name)}</span><br><span class="role">${esc(who.role)}</span></span></div>
           <p class="muted" style="margin-top:12px;font-size:var(--fs-sm)">${esc(who.style)}</p>
           <div class="row" style="margin-top:12px;gap:6px"><span class="pill">${esc(src.label || c.kind)}</span>
@@ -486,16 +535,26 @@ async function renderChat(arg, ccArg) {
       </div>
     </div>
 
-    <div class="stage scene">
+    <div class="stage scene call">
       <div class="bar">
-        <div class="lower-third"><span class="avatar">${initial(scenario.persona)}</span>
-          <span><span class="name">${esc(scenario.persona)}</span><br><span class="role">${esc(scenario.briefing?.persona?.role || scenario.role || "")}</span></span></div>
+        <span class="pill call-time"><span class="live-dot" aria-hidden="true"></span><span id="call-time" class="num">00:00</span></span>
         <div class="seg" role="group" aria-label="Legendas">${CC_MODES.map(([v, l]) => `<button type="button" data-cc="${v}" aria-pressed="${v === cc}">${v === "off" ? ic("cc") : ""}${l}</button>`).join("")}</div>
       </div>
-      <div></div>
+      <div class="speaker" id="speaker" style="--lvl:0">
+        <span class="ring" aria-hidden="true"></span>${avatar(scenario.voice, scenario.persona, "face")}
+      </div>
       <div class="line" aria-live="polite">
         <div id="sub-slot"></div>
         <div id="you"></div>
+      </div>
+      <div class="nameplate" id="nameplate" style="--lvl:0">
+        <span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>${esc(scenario.persona)}</strong> <span class="role">${esc(scenario.briefing?.persona?.role || scenario.role || "")}</span></span>
+      </div>
+      <div class="self-tile" id="self-tile" style="--lvl:0" aria-label="Seu microfone">
+        <span class="avatar">VC</span><span class="self-name">Você</span>
+        <span class="self-mic" id="self-mic">${ic("micOff")}</span>
+        <span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>
       </div>
     </div>
 
@@ -529,6 +588,18 @@ async function renderChat(arg, ccArg) {
   let session = null, busy = true, lastAssistant = "", helpRec = null;
   const listening = { reveals: 0, replays: 0 };
   const turns = [];
+
+  // ---- meeting-style speaking indicators driven by real audio levels ----
+  const speakerEl = $("#speaker"), plate = $("#nameplate"), selfTile = $("#self-tile");
+  speakLevel = (l) => { speakerEl.style.setProperty("--lvl", l.toFixed(3)); plate.style.setProperty("--lvl", l.toFixed(3)); };
+  rec.onLevel = (l) => selfTile.style.setProperty("--lvl", l.toFixed(3));
+  const setPartnerSpeaking = (on) => { speakerEl.classList.toggle("speaking", on); plate.classList.toggle("speaking", on); };
+  const setSelfLive = (on) => {
+    selfTile.classList.toggle("live", on);
+    $("#self-mic").innerHTML = ic(on ? "mic" : "micOff");
+  };
+  const t0 = Date.now();
+  const clock = setInterval(() => { const s = Math.floor((Date.now() - t0) / 1000); $("#call-time").textContent = fmtSec(s).padStart(5, "0"); }, 1000);
 
   // ---- captions ----
   function renderSubtitle(speaking = false) {
@@ -596,7 +667,9 @@ async function renderChat(arg, ccArg) {
     renderSubtitle(true);
     busy = false; mic.disabled = false;
     hint.textContent = `${scenario.persona} está falando… você já pode responder`;
+    setPartnerSpeaking(true);
     await speak(text, session.voice);
+    setPartnerSpeaking(false);
     renderSubtitle(false);
     if (!rec.active) setBusy(false);
   }
@@ -604,6 +677,8 @@ async function renderChat(arg, ccArg) {
   async function startRec() {
     if (busy || rec.active) return;
     try { await rec.start(); } catch (e) { hint.textContent = "Sem acesso ao microfone: " + e.message; return; }
+    setPartnerSpeaking(false);
+    setSelfLive(true);
     mic.classList.add("rec");
     mic.setAttribute("aria-label", "Parar e enviar");
     mic.innerHTML = ic("square");
@@ -611,6 +686,7 @@ async function renderChat(arg, ccArg) {
   }
   async function stopRec() {
     if (!rec.active) return;
+    setSelfLive(false);
     mic.classList.remove("rec");
     mic.setAttribute("aria-label", "Falar");
     mic.innerHTML = ic("mic");
@@ -640,6 +716,8 @@ async function renderChat(arg, ccArg) {
   document.addEventListener("keydown", onKey);
   document.addEventListener("keyup", onKey);
   cleanup = () => {
+    speakLevel = null;
+    clearInterval(clock);
     document.removeEventListener("keydown", onKey);
     document.removeEventListener("keyup", onKey);
     rec.stop();
@@ -788,7 +866,6 @@ async function renderReport(id) {
 // retell (4/3/2 adapted: 2 min -> 1:30 -> 1 min)
 // =====================================================================
 const ROUNDS = [120, 90, 60];
-const fmtSec = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 
 async function renderRetell(id) {
   const s = await api("/api/session/" + id);

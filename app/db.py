@@ -172,6 +172,7 @@ def list_custom() -> list[dict]:
         d = json.loads(r.pop("data_json"))
         r["desc_pt"] = d.get("desc_pt")
         r["persona"] = (d.get("persona") or {}).get("name")
+        r["voice"] = (d.get("persona") or {}).get("voice")
         r["source"] = d.get("source")
     return rows
 
