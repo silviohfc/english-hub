@@ -20,13 +20,69 @@ from . import config
 def track() -> str:
     return config.TRACK if config.TRACK in ("dev", "daily") else "dev"
 
-VOICES = {
-    "af_heart": "American female, warm", "af_bella": "American female, energetic",
-    "af_nicole": "American female, calm/soft", "am_michael": "American male, neutral",
-    "am_adam": "American male, casual", "am_puck": "American male, upbeat",
-    "am_eric": "American male, serious", "bf_emma": "British female", "bm_george": "British male, formal",
-    "bm_lewis": "British male, relaxed",
+# Every Kokoro voice the app uses is ONE fixed character: same name, accent, personality and portrait
+# (app/static/avatars/<voice>.jpg) everywhere, in the classic scenarios and in the generated ones.
+CHARACTERS = {
+    # American women
+    "af_heart":   {"name": "Mia", "full": "Mia Chen", "from": "San Diego", "sex": "female", "accent": "American",
+                   "style": "warm, easygoing, curious about people"},
+    "af_alloy":   {"name": "Rachel", "full": "Rachel Torres", "from": "New York", "sex": "female", "accent": "American",
+                   "style": "direct, sharp, no-nonsense"},
+    "af_aoede":   {"name": "Chloe", "full": "Chloe Martin", "from": "Austin", "sex": "female", "accent": "American",
+                   "style": "creative, chatty, expressive"},
+    "af_bella":   {"name": "Bella", "full": "Bella Rossi", "from": "Denver", "sex": "female", "accent": "American",
+                   "style": "energetic, friendly, outgoing"},
+    "af_jessica": {"name": "Jessica", "full": "Jessica Moore", "from": "Chicago", "sex": "female", "accent": "American",
+                   "style": "upbeat, quick, practical"},
+    "af_kore":    {"name": "Megan", "full": "Megan Clarke", "from": "Boston", "sex": "female", "accent": "American",
+                   "style": "calm, measured, thoughtful"},
+    "af_nova":    {"name": "Nora", "full": "Nora Hayes", "from": "San Francisco", "sex": "female", "accent": "American",
+                   "style": "enthusiastic, fast-paced, ambitious"},
+    "af_river":   {"name": "Riley", "full": "Riley Brooks", "from": "Portland", "sex": "female", "accent": "American",
+                   "style": "laid-back, relaxed, funny"},
+    "af_sarah":   {"name": "Sarah", "full": "Sarah Collins", "from": "Atlanta", "sex": "female", "accent": "American",
+                   "style": "friendly, organized, professional"},
+    "af_sky":     {"name": "Hannah", "full": "Hannah Reyes", "from": "Los Angeles", "sex": "female", "accent": "American",
+                   "style": "young, cheerful, informal"},
+    # American men
+    "am_adam":    {"name": "Adam", "full": "Adam Walsh", "from": "Chicago", "sex": "male", "accent": "American",
+                   "style": "casual, friendly, a good teammate"},
+    "am_echo":    {"name": "Raj", "full": "Raj Patel", "from": "Philadelphia", "sex": "male", "accent": "American",
+                   "style": "calm, patient, reassuring"},
+    "am_eric":    {"name": "Eric", "full": "Eric Lawson", "from": "Dallas", "sex": "male", "accent": "American",
+                   "style": "serious, formal, to the point"},
+    "am_fenrir":  {"name": "Ryan", "full": "Ryan Cole", "from": "Phoenix", "sex": "male", "accent": "American",
+                   "style": "confident, assertive, competitive"},
+    "am_liam":    {"name": "Liam", "full": "Liam Carter", "from": "Minneapolis", "sex": "male", "accent": "American",
+                   "style": "curious, analytical, asks why"},
+    "am_onyx":    {"name": "Marcus", "full": "Marcus Reed", "from": "Miami", "sex": "male", "accent": "American",
+                   "style": "deep-voiced, businesslike, firm but fair"},
+    "am_puck":    {"name": "Alex", "full": "Alex Rivera", "from": "Seattle", "sex": "male", "accent": "American",
+                   "style": "upbeat, playful, talkative"},
+    # British
+    "bf_emma":    {"name": "Emma", "full": "Emma Hughes", "from": "London", "sex": "female", "accent": "British",
+                   "style": "composed, warm but direct"},
+    "bf_isabella": {"name": "Isabella", "full": "Isabella Grant", "from": "Manchester", "sex": "female",
+                    "accent": "British", "style": "polished, articulate, demanding"},
+    "bm_daniel":  {"name": "Daniel", "full": "Daniel Price", "from": "London", "sex": "male", "accent": "British",
+                   "style": "polite, helpful, formal"},
+    "bm_fable":   {"name": "Oliver", "full": "Oliver Bennett", "from": "Bristol", "sex": "male", "accent": "British",
+                   "style": "witty, relaxed, a storyteller"},
 }
+VOICES = {v: f"{c['name']}, {c['accent']} {c['sex']} from {c['from']}, {c['style']}" for v, c in CHARACTERS.items()}
+# Voices used by older versions, mapped to the character that took over their role.
+LEGACY_VOICES = {"af_nicole": "af_jessica", "am_michael": "am_liam", "bm_george": "bm_daniel", "bm_lewis": "bm_fable"}
+DEFAULT_VOICE = "am_liam"
+
+
+def voice(v: str | None) -> str:
+    """A valid voice for anything stored (old sessions, saved scenarios, model output)."""
+    v = LEGACY_VOICES.get(v or "", v)
+    return v if v in CHARACTERS else DEFAULT_VOICE
+
+
+def character(v: str | None) -> dict:
+    return {"voice": voice(v), **CHARACTERS[voice(v)]}
 
 # ---------- built-in (classic) scenarios ----------
 
@@ -35,7 +91,7 @@ SCENARIOS = {
         "title": "Recruiter screening",
         "title_pt": "Triagem com recruiter",
         "desc_pt": "Primeira call com recruiter de startup americana: sobre você, motivação, remoto, salário.",
-        "persona": "Sarah", "voice": "af_heart",
+        "persona": "Sarah", "voice": "af_sarah",
         "brief": (
             "You are Sarah, a friendly technical recruiter at a fast-growing US startup (remote-first, "
             "team spread across the Americas). This is a 30-minute screening call for a Mid-level Software "
@@ -49,9 +105,9 @@ SCENARIOS = {
         "title": "Technical interview",
         "title_pt": "Entrevista técnica",
         "desc_pt": "Engenheiro sênior pede para você explicar projetos, decisões, trade-offs e debugging.",
-        "persona": "Mike", "voice": "am_michael",
+        "persona": "Liam", "voice": "am_liam",
         "brief": (
-            "You are Mike, a senior software engineer at a US product company interviewing a Mid-level "
+            "You are Liam, a senior software engineer at a US product company interviewing a Mid-level "
             "Developer. This is a conversational technical interview (no live coding). Start by asking what "
             "stack they work with, then dig into a real project they built: architecture, why they chose X "
             "over Y, trade-offs, how they'd scale it, a hard bug they debugged, testing, code review. Ask "
@@ -77,9 +133,9 @@ SCENARIOS = {
         "title": "Daily standup & small talk",
         "title_pt": "Daily e small talk",
         "desc_pt": "Colega de time: papo sobre o fim de semana, depois status da daily, bloqueios e dúvidas.",
-        "persona": "Jake", "voice": "am_adam",
+        "persona": "Adam", "voice": "am_adam",
         "brief": (
-            "You are Jake, a teammate (backend engineer from Chicago) on a distributed team. Start with "
+            "You are Adam, a teammate (backend engineer from Chicago) on a distributed team. Start with "
             "casual small talk before the standup (weekend, weather, plans). Then run a short daily: ask what "
             "they did yesterday, what they're doing today, any blockers. Sometimes ask them to clarify a "
             "technical detail, propose a quick pairing session, or politely push back on an estimate, so they "
@@ -102,9 +158,9 @@ SCENARIOS = {
         "title": "Meeting someone new",
         "title_pt": "Conhecendo alguém",
         "desc_pt": "Vizinha nova puxa papo: de onde você é, trabalho, a cidade, planos para o fim de semana.",
-        "persona": "Olivia", "voice": "af_bella",
+        "persona": "Bella", "voice": "af_bella",
         "brief": (
-            "You are Olivia, a friendly person in her thirties from Denver who just moved into the learner's "
+            "You are Bella, a friendly person in her thirties from Denver who just moved into the learner's "
             "building. You meet in the elevator/lobby and start chatting: introduce yourself, ask where they're "
             "from, what they do, how long they've lived here, recommendations (food, parks, things to do), and "
             "maybe suggest grabbing a coffee sometime. Keep it light, warm and natural, like real small talk."
@@ -114,9 +170,9 @@ SCENARIOS = {
         "title": "Airport and immigration",
         "title_pt": "Aeroporto e imigração",
         "desc_pt": "Oficial de imigração nos EUA: motivo da viagem, quanto tempo fica, onde vai ficar, o que traz.",
-        "persona": "Officer Daniels", "voice": "am_eric",
+        "persona": "Officer Reed", "voice": "am_onyx",
         "brief": (
-            "You are Officer Daniels, a US Customs and Border Protection officer at the immigration desk of a "
+            "You are Officer Marcus Reed, a US Customs and Border Protection officer at the immigration desk of a "
             "US airport. Be polite but brief and businesslike. Ask, one at a time: purpose of the trip, how long "
             "they're staying, where they're staying, their job back home, whether they've been to the US before, "
             "if they're traveling alone, return ticket, and anything to declare. React to vague answers with a "
@@ -127,9 +183,9 @@ SCENARIOS = {
         "title": "Hotel check-in",
         "title_pt": "Check-in no hotel",
         "desc_pt": "Recepcionista: reserva, documentos, horário do café, e um problema com o quarto para resolver.",
-        "persona": "Tom", "voice": "bm_lewis",
+        "persona": "Daniel", "voice": "bm_daniel",
         "brief": (
-            "You are Tom, a front-desk receptionist at a mid-size hotel in London. Check the guest in: find the "
+            "You are Daniel, a front-desk receptionist at a mid-size hotel in London. Check the guest in: find the "
             "booking, ask for ID and a card for incidentals, explain breakfast times, wifi and checkout. Halfway "
             "through, mention a small problem (the room type they booked isn't ready, or there's a city tax to "
             "pay) so they have to ask questions and negotiate politely. Be helpful and professional."
@@ -139,7 +195,7 @@ SCENARIOS = {
         "title": "Ordering at a restaurant",
         "title_pt": "Pedindo no restaurante",
         "desc_pt": "Garçonete americana: mesa, pedido, restrições alimentares, ponto da carne, conta e gorjeta.",
-        "persona": "Jessica", "voice": "af_nicole",
+        "persona": "Jessica", "voice": "af_jessica",
         "brief": (
             "You are Jessica, a server at a casual American restaurant. Greet the guest, offer drinks, explain a "
             "special, take the order with typical follow-up questions (how they'd like it cooked, sides, dressing, "
@@ -151,9 +207,9 @@ SCENARIOS = {
         "title": "At the doctor's",
         "title_pt": "Consulta médica",
         "desc_pt": "Médico: descreva sintomas, há quanto tempo, alergias e remédios, e entenda as orientações.",
-        "persona": "Dr. Patel", "voice": "am_michael",
+        "persona": "Dr. Patel", "voice": "am_echo",
         "brief": (
-            "You are Dr. Patel, a calm general practitioner at a walk-in clinic. Ask what brings them in, then "
+            "You are Dr. Raj Patel, a calm general practitioner at a walk-in clinic. Ask what brings them in, then "
             "explore the symptoms one question at a time: when it started, how bad (1 to 10), what makes it "
             "better or worse, other symptoms, allergies, current medication. Give simple advice and a plan, and "
             "check they understood the instructions. Keep it to a plausible everyday case (a cold, a sprained "
@@ -334,7 +390,18 @@ def situation_ids() -> list[str]:
     return TRACK_SITUATIONS[track()]
 
 
-def chat_system_prompt(scn: dict, level: str, watch_items: list[dict], phrases: list[dict] | None = None) -> str:
+# Added to the partner's rules when the voice engine can act out emotion (Orpheus).
+EXPRESSIVE = """10. Your voice is expressive: speak with real feelings, like a person would (surprise, enthusiasm, doubt,
+   concern, sympathy), through your word choice and interjections ("Oh wow", "Hmm", "Ah, I see", "Oh no").
+   You can also make sounds by writing ONE of these tags inside a sentence: <laugh> or <chuckle> when something is
+   funny, <sigh> for bad news or tiredness, <gasp> for a real surprise, <groan> for something annoying.
+   Example: "Oh no, they lost your bag? <sigh> Airlines, right?". Use at most one per turn, only where a real
+   person would make that sound; many turns have none. This is the only exception to rule 7.
+"""
+
+
+def chat_system_prompt(scn: dict, level: str, watch_items: list[dict], phrases: list[dict] | None = None,
+                       expressive: bool = False) -> str:
     watch = ""
     if phrases:
         plist = "\n".join(f'- "{p["text"]}"' for p in phrases)
@@ -370,7 +437,7 @@ How you must behave:
 8. If the learner says they want to wrap up, close the conversation politely in one or two sentences.
 9. If they ask you to repeat or slow down ("Sorry, could you say that again?"), do it naturally, like a real
    person: repeat a bit slower and, if they still struggle, rephrase with simpler words.
-{watch}
+{EXPRESSIVE if expressive else ""}{watch}
 The first user message will be [START]. Respond with your natural opening line."""
 
 
@@ -388,7 +455,7 @@ SCENARIO_SPEC = """{
   "title": "short English title",
   "title_pt": "título curto em português",
   "desc_pt": "1 frase descrevendo o cenário",
-  "persona": {"name": "first name", "role": "who they are: job title + team/company, or role + place", "voice": "one of VOICES", "style": "personality in a few words"},
+  "persona": {"name": "the chosen character's first name (exactly as in CHARACTERS)", "role": "who they are: job title + team/company, or role + place", "voice": "the chosen character's voice id", "style": "the character's personality, adapted to this role"},
   "briefing_pt": {
     "contexto": "onde você está (empresa/produto/time, ou o lugar) e o seu papel (2-4 frases)",
     "situacao": "o que está acontecendo agora e com quem você vai falar",
@@ -405,7 +472,9 @@ SCENARIO_SPEC = """{
 
 
 def _voices_line() -> str:
-    return ", ".join(f"{k} ({v})" for k, v in VOICES.items())
+    lines = "\n".join(f"- {k}: {v}" for k, v in VOICES.items())
+    return ("pick the ONE character whose personality and accent best fit the partner; the partner IS that "
+            "character (same first name and personality, any role that fits):\n" + lines)
 
 
 def situation_prompt(kind: str, profile: str, pressure: str) -> str:
@@ -437,7 +506,7 @@ Situation type: {s['title_pt']}
 The briefing must give the learner ALL the facts they need to explain (concrete and specific), so the challenge is
 communicating clearly in English, not inventing content. The partner must not know those facts in advance.
 
-VOICES: {_voices_line()}
+CHARACTERS (voice id: who): {_voices_line()}
 
 Return ONE JSON object with exactly this shape:
 {SCENARIO_SPEC}
@@ -468,7 +537,7 @@ Requirements:
 - persona_brief_en: realistic flow for this stage (8-12 questions, one at a time, with follow-ups), the
   requirements to probe, the gaps to investigate, and how a real interviewer at this company would react.
 
-VOICES: {_voices_line()}
+CHARACTERS (voice id: who): {_voices_line()}
 
 Return ONE JSON object with exactly this shape:
 {SCENARIO_SPEC}

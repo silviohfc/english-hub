@@ -7,7 +7,7 @@ import threading
 import re
 from datetime import datetime, timedelta
 
-from . import config
+from . import config, prompts
 
 _lock = threading.Lock()
 _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
@@ -172,7 +172,10 @@ def get_custom(cid: int) -> dict | None:
     if not rows:
         return None
     r = rows[0]
-    return {"id": r["id"], "kind": r["kind"], "created_at": r["created_at"], **json.loads(r["data_json"])}
+    data = json.loads(r["data_json"])
+    if isinstance(data.get("persona"), dict):
+        data["persona"]["voice"] = prompts.voice(data["persona"].get("voice"))
+    return {"id": r["id"], "kind": r["kind"], "created_at": r["created_at"], **data}
 
 
 def list_custom() -> list[dict]:
@@ -183,7 +186,7 @@ def list_custom() -> list[dict]:
         d = json.loads(r.pop("data_json"))
         r["desc_pt"] = d.get("desc_pt")
         r["persona"] = (d.get("persona") or {}).get("name")
-        r["voice"] = (d.get("persona") or {}).get("voice")
+        r["voice"] = prompts.voice((d.get("persona") or {}).get("voice"))
         r["source"] = d.get("source")
     return rows
 

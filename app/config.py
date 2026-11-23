@@ -35,6 +35,10 @@ WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(max(1, (os.cpu_co
 # Text-to-speech (Kokoro, ONNX, runs on CPU).
 KOKORO_MODEL = MODELS_DIR / "kokoro-v1.0.onnx"
 KOKORO_VOICES = MODELS_DIR / "voices-v1.0.bin"
+# Voice engine for the characters: "kokoro" (built in, neutral) or an expressive one installed on demand into its
+# own Python environment under models/engines/<id> ("orpheus"). See app/voices.py.
+TTS_ENGINE = _env("TTS_ENGINE", "kokoro")
+ENGINES_DIR = MODELS_DIR / "engines"
 
 # LLM via a local CLI and the user's own plan: claude (Claude Code), gemini (Antigravity CLI) or codex (Codex CLI).
 # Each role picks a provider and a model ("" = the provider's default model).
@@ -78,6 +82,7 @@ EDITABLE = {
     "chat_model": ("CHAT_MODEL", str),
     "feedback_model": ("FEEDBACK_MODEL", str),
     "helper_model": ("HELPER_MODEL", str),
+    "tts_engine": ("TTS_ENGINE", str),
 }
 FLAGS = ("setup_done", "onboarding_done")
 
@@ -103,7 +108,8 @@ def role(name: str) -> tuple[str, str]:
 
 
 VALID = {"track": {"dev", "daily"}, "chat_provider": {"claude", "gemini", "codex"},
-         "feedback_provider": {"claude", "gemini", "codex"}, "helper_provider": {"claude", "gemini", "codex"}}
+         "feedback_provider": {"claude", "gemini", "codex"}, "helper_provider": {"claude", "gemini", "codex"},
+         "tts_engine": {"kokoro", "orpheus"}}
 
 
 def apply(values: dict) -> dict:

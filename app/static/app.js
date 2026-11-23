@@ -43,7 +43,9 @@ const fmtDay = (iso) => (iso ? new Date(iso).toLocaleDateString("pt-BR", { day: 
 const pct = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
 const dash = (x) => (x == null || x === "" ? "–" : x);
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-const VOICES = ["af_heart", "af_bella", "af_nicole", "am_michael", "am_adam", "am_puck", "am_eric", "bf_emma", "bm_george", "bm_lewis"];
+// Each voice is one fixed character with its own portrait (names live in app/prompts.py CHARACTERS).
+const VOICES = ["af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore", "af_nova", "af_river", "af_sarah", "af_sky",
+  "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_onyx", "am_puck", "bf_emma", "bf_isabella", "bm_daniel", "bm_fable"];
 // Portrait for a voice (photos in /static/avatars, see CREDITS.md); falls back to the initial if missing.
 const avatar = (voice, name, cls = "") => `<span class="avatar ${cls}">${initial(name)}${VOICES.includes(voice)
   ? `<img src="/static/avatars/${voice}.jpg" alt="" loading="lazy" onerror="this.remove()">` : ""}</span>`;
@@ -118,7 +120,7 @@ const isDev = () => (FLAGS?.track || "dev") !== "daily";
 // audio
 // =====================================================================
 let currentAudio = null;
-function stopAudio() { if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
+function stopAudio() { speakToken++; if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
 
 // Live audio level (0..1) from any audio node, like the speaking indicator of meeting apps.
 let actx = null;
@@ -147,10 +149,33 @@ function meter(node, onLevel) {
 }
 let speakLevel = null; // set by the call screen to animate the partner's portrait
 
-async function speak(text, voice) {
-  stopAudio();
-  const blob = await api("/api/tts", { json: { text, voice, speed: settings.speed } });
-  const audio = new Audio(URL.createObjectURL(blob));
+// Voice engine in use ("kokoro" neutral, "orpheus" expressive); kept fresh by pollStatus and the settings page.
+let VOICE_ENGINE = "kokoro";
+let speakToken = 0;
+// A slow expressive engine speaks sentence by sentence: the next one is generated while the current one plays.
+function sentenceChunks(text) {
+  const parts = (text.match(/[^.!?…]+(?:[.!?…]+["')\]]*|$)\s*/g) || [text]).map((x) => x.trim()).filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    if (out.length && out[out.length - 1].length < 40) out[out.length - 1] += " " + p;
+    else out.push(p);
+  }
+  return out.length ? out : [text];
+}
+async function ttsAudio(text, voice, engine) {
+  const res = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice, speed: settings.speed, engine: engine || "" }) });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { msg = (await res.json()).detail || msg; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  const audio = new Audio(URL.createObjectURL(await res.blob()));
+  // Engines without speed control (Orpheus): the browser changes the speed and keeps the pitch.
+  if (res.headers.get("X-TTS-Speed") === "browser") { audio.preservesPitch = true; audio.playbackRate = settings.speed; }
+  return audio;
+}
+async function playAudio(audio) {
   currentAudio = audio;
   let stopMeter = null;
   // Route through the meter only when the audio context is already running; otherwise the voice would be muted.
@@ -166,6 +191,22 @@ async function speak(text, voice) {
     const done = () => { stopMeter?.(); r(); };
     audio.onended = done; audio.onpause = done;
   });
+}
+// Speak a character's line. `engine` previews a specific engine; `onStart` fires when the sound actually begins.
+async function speak(text, voice, { engine, onStart } = {}) {
+  stopAudio();
+  const token = speakToken;
+  const parts = (engine || VOICE_ENGINE) === "orpheus" ? sentenceChunks(text) : [text];
+  let next = ttsAudio(parts[0], voice, engine);
+  for (let i = 0; i < parts.length; i++) {
+    const audio = await next;
+    if (token !== speakToken) return;
+    next = i + 1 < parts.length ? ttsAudio(parts[i + 1], voice, engine) : null;
+    next?.catch(() => {}); // a prefetch failure surfaces when it is awaited
+    if (i === 0) onStart?.();
+    await playAudio(audio);
+    if (token !== speakToken) return;
+  }
 }
 
 // Chrome/Edge/Firefox record webm/opus; Safari (macOS) records mp4/aac. The server decodes either.
@@ -260,10 +301,11 @@ async function pollStatus() {
   try {
     const s = await api("/api/status");
     FLAGS = { ...(FLAGS || {}), setup_done: s.setup_done, onboarding_done: s.onboarding_done, track: s.track };
+    VOICE_ENGINE = s.voice_engine || "kokoro";
     if (!s.setup_done) { el.textContent = "configuração pendente"; el.className = "status"; setTimeout(pollStatus, 4000); return; }
     if (s.stt && s.tts) {
       el.textContent = "pronto para falar";
-      el.title = `ouvido: ${s.stt} · conversa: ${s.chat_model} · feedback: ${s.feedback_model}`;
+      el.title = `ouvido: ${s.stt} · voz: ${s.voice_engine} · conversa: ${s.chat_model} · feedback: ${s.feedback_model}`;
       el.className = "status ok";
       return;
     }
@@ -649,7 +691,7 @@ async function renderChat(arg, ccArg) {
   speed.oninput = () => store.set("speed", Number(speed.value));
 
   const rec = new Recorder();
-  let session = null, busy = true, lastAssistant = "", helpRec = null;
+  let session = null, busy = true, lastAssistant = "", lastSay = "", helpRec = null;
   const listening = { reveals: 0, replays: 0 };
   const turns = [];
 
@@ -724,15 +766,18 @@ async function renderChat(arg, ccArg) {
     hint.innerHTML = text || (b ? "…" : `Clique no microfone ou segure <kbd>Espaço</kbd> para falar`);
   };
 
-  async function personaSays(text) {
+  // `say` is the same line with sound tags (<laugh>...) for the expressive voice; `text` is what is shown.
+  async function personaSays(text, say) {
     lastAssistant = text;
+    lastSay = say || text;
     turns.push({ role: "assistant", text });
     renderLines();
     renderSubtitle(true);
     busy = false; mic.disabled = false;
-    hint.textContent = `${scenario.persona} está falando… você já pode responder`;
-    setPartnerSpeaking(true);
-    await speak(text, session.voice);
+    const talking = () => { hint.textContent = `${scenario.persona} está falando… você já pode responder`; setPartnerSpeaking(true); };
+    if (VOICE_ENGINE === "orpheus") hint.textContent = `${scenario.persona} vai falar…`;
+    else talking();
+    try { await speak(lastSay, session.voice, { onStart: talking }); } catch (e) { toast("Voz: " + e.message); }
     setPartnerSpeaking(false);
     renderSubtitle(false);
     if (!rec.active) setBusy(false);
@@ -765,7 +810,7 @@ async function renderChat(arg, ccArg) {
       turns.push({ role: "user", text: r.user.text });
       showYou(r.user);
       hint.textContent = `${scenario.persona} está pensando…`;
-      await personaSays(r.reply);
+      await personaSays(r.reply, r.say);
     } catch (e) { setBusy(false, "Erro: " + esc(e.message)); }
   }
 
@@ -791,7 +836,7 @@ async function renderChat(arg, ccArg) {
   $("#btn-replay").onclick = () => {
     if (!lastAssistant) return;
     if (cc === "reveal") listening.replays++;
-    speak(lastAssistant, session.voice);
+    speak(lastSay || lastAssistant, session.voice).catch((e) => toast(e.message));
   };
 
   const drawer = $("#drawer");
@@ -848,7 +893,7 @@ async function renderChat(arg, ccArg) {
   try {
     session = await api("/api/session/start", { json: { scenario: scenario.id, level: settings.level } });
     currentVoice = session.voice;
-    await personaSays(session.reply);
+    await personaSays(session.reply, session.say);
   } catch (e) { setBusy(true, "Não conectou: " + esc(e.message)); }
 }
 
@@ -1383,7 +1428,7 @@ function bindModelControls(root, o, onChange) {
 // Planned job rows before the install runs, from what is already on disk.
 function plannedItems(o) {
   const mb = (id) => (o.options.whisper_models.find((m) => m.id === id)?.mb || 0) * 1e6;
-  const items = [{ id: "kokoro", label: "Voz · Kokoro e 10 vozes", detail: "kokoro-v1.0 · ONNX na CPU", status: o.models.kokoro ? "done" : "pending", est: o.models.kokoro ? 0 : 354e6 }];
+  const items = [{ id: "kokoro", label: "Voz · Kokoro (21 personagens)", detail: "kokoro-v1.0 · ONNX na CPU", status: o.models.kokoro ? "done" : "pending", est: o.models.kokoro ? 0 : 354e6 }];
   Object.entries(o.models.whisper).forEach(([name, ok], i) => items.push({ id: "whisper:" + name,
     label: i === 0 ? `Ouvido · Whisper ${name}` : `Reserva para CPU · Whisper ${name}`,
     detail: i === 0 ? "reconhecimento de fala" : "usado se a GPU falhar", status: ok ? "done" : "pending", est: ok ? 0 : mb(name) }));
@@ -1584,8 +1629,8 @@ function obMic() {
 }
 
 const voiceSample = () => (isDev()
-  ? { voice: "am_michael", name: "Mike", role: "Senior engineer · exemplo", line: "So, tell me a bit about the last project you worked on. What was your part in it?" }
-  : { voice: "af_nicole", name: "Jessica", role: "Garçonete · exemplo", line: "Hi there! Are you ready to order, or do you need a few more minutes with the menu?" });
+  ? { voice: "am_liam", name: "Liam", role: "Senior engineer · exemplo", line: "So, tell me a bit about the last project you worked on. What was your part in it?" }
+  : { voice: "af_jessica", name: "Jessica", role: "Garçonete · exemplo", line: "Hi there! Are you ready to order, or do you need a few more minutes with the menu?" });
 function obVoice() {
   const vs = voiceSample();
   view.innerHTML = `<div class="flow-grid">
@@ -1700,7 +1745,7 @@ async function obCall() {
 // =====================================================================
 async function renderSettings() {
   let o = await api("/api/setup");
-  let job = o.job, timer = null, dirty = false, aiP = null;
+  let job = o.job, timer = null, dirty = false, aiP = null, voiceP = null;
   view.innerHTML = pageHead("Configurações", "Aparência, ritmo da conversa e os modelos que rodam no seu computador.") + `<div class="settings" id="set"></div>`;
   const root = $("#set");
   function paint() {
@@ -1716,6 +1761,8 @@ async function renderSettings() {
         <label class="field">Legendas ao começar <select id="s-cc">${CC_MODES.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></label>
         <label class="field">Nível do interlocutor <select id="s-level"><option value="friendly">Amigável: claro, sem muita gíria</option><option value="realistic">Realista: velocidade e expressões nativas</option></select></label>
       </div></section>
+      <section class="set-sec"><header><h2>Voz dos personagens</h2><p>Com ou sem emoção. A voz com emoção só aparece liberada se o seu computador aguenta.</p></header>
+        <div class="body" id="s-voice"></div></section>
       <section class="set-sec"><header><h2>Reconhecimento e modelos</h2><p>Trocar o modelo baixa o novo e recarrega o ouvido.</p></header><div class="body">
         ${presetHTML(o, running)}
         ${advancedHTML(o, running)}
@@ -1743,6 +1790,8 @@ async function renderSettings() {
     aiP?.stop();
     aiP = aiPanel($("#s-ai"), $("#s-roles"));
     aiP.load();
+    voiceP?.stop();
+    voiceP = voicePanel($("#s-voice"));
     paintJob(missing);
   }
   function paintJob(missing) {
@@ -1769,9 +1818,86 @@ async function renderSettings() {
     job = await api("/api/setup/job").catch(() => job);
     if (job.status === "running") { paintJob(true); timer = setTimeout(poll, 700); } else { o = await api("/api/setup"); paint(); }
   }
-  cleanup = () => { clearTimeout(timer); aiP?.stop(); };
+  cleanup = () => { clearTimeout(timer); aiP?.stop(); voiceP?.stop(); };
   paint();
   if (job.status === "running") poll();
+}
+
+// =====================================================================
+// voice engines: Kokoro (neutral) and Orpheus (expressive, only on capable hardware)
+// =====================================================================
+const VOICE_SAMPLE = { voice: "am_puck", text: "Oh, no way, you actually got the job? <laugh> That's amazing! Tell me everything." };
+function engineCardHTML(e, v, ui) {
+  const on = v.active === e.id, sup = e.support, job = e.job, running = job?.status === "running";
+  const loading = e.id === "orpheus" && on && e.worker === "loading";
+  const kind = e.emotion ? `<span class="pill sub">${ic("sparkles")} Com emoção</span>` : `<span class="pill">Voz neutra</span>`;
+  let speed = "";
+  if (e.id === "kokoro") speed = "Responde na hora.";
+  else if (e.rtf) speed = `Neste computador, gerar a fala leva ${e.rtf.toFixed(1).replace(".", ",")}× a duração dela: o personagem demora alguns segundos a mais para responder.`;
+  else speed = "Mais lenta que a Kokoro: o personagem demora alguns segundos a mais para responder.";
+  let acts = "";
+  if (!sup.ok) acts = "";
+  else if (!e.installed && ui.confirm) acts = `<span class="muted">Baixar cerca de ${fmtBytes(e.size_mb * 1e6)}?</span>
+      <button class="btn" data-eng="install-yes">Instalar</button><button class="btn btn-ghost" data-eng="install-no">Cancelar</button>`;
+  else if (!e.installed) acts = running ? "" : `<button class="btn" data-eng="install">${ic("download")} Instalar (${fmtBytes(e.size_mb * 1e6)})</button>`;
+  else acts = `<button class="btn" data-eng="sample" data-id="${e.id}" ${ui.playing ? "disabled" : ""}>${ic("play")} ${ui.playing === e.id ? "Gerando…" : "Ouvir exemplo"}</button>
+      ${on ? "" : `<button class="btn" data-eng="use" data-id="${e.id}">${ic("check")} Usar esta voz</button>`}`;
+  const showJob = sup.ok && e.id === "orpheus" && job && job.status !== "idle" && !(job.status === "done" && e.installed && !ui.justInstalled);
+  return `<div class="engine ${on ? "on" : ""} ${sup.ok ? "" : "off"}" ${sup.ok ? "" : 'aria-disabled="true"'}>
+    <div class="eng-head"><b>${esc(e.label)}</b>${kind}${on ? `<span class="pill ok">${ic("check")} Em uso</span>` : ""}</div>
+    <p class="d">${esc(e.summary)}</p>
+    <p class="d muted">${esc(e.voices)} · ${esc(speed)}</p>
+    ${sup.ok ? "" : `<p class="eng-off">${ic("ban")} Desativada neste computador. ${esc(sup.reason)}</p>`}
+    ${loading ? `<div class="d">Carregando o Orpheus na GPU…</div>${strip(16, "sm busy")}` : ""}
+    ${e.worker === "error" && on ? `<p class="warn-line">O Orpheus não carregou (${esc(e.worker_error)}). Enquanto isso, os personagens falam com a Kokoro.</p>` : ""}
+    ${showJob ? `<div class="jobs">${job.items.map(jobRowHTML).join("")}</div>` : ""}
+    ${acts ? `<div class="row">${acts}</div>` : ""}</div>`;
+}
+function voicePanel(root) {
+  let v = null, timer = null, stopped = false;
+  const ui = { confirm: false, playing: "", justInstalled: false };
+  function paint() {
+    if (!v) { root.innerHTML = `<p class="muted">Verificando o que este computador aguenta…</p>`; return; }
+    VOICE_ENGINE = v.active;
+    root.innerHTML = `<div class="engines">${v.engines.map((e) => engineCardHTML(e, v, ui)).join("")}</div>`;
+  }
+  async function load() {
+    clearTimeout(timer);
+    v = await api("/api/voices").catch(() => v);
+    if (stopped) return;
+    paint();
+    const o = v?.engines.find((e) => e.id === "orpheus");
+    if (o && (o.job?.status === "running" || (v.active === "orpheus" && o.worker === "loading"))) {
+      ui.justInstalled = ui.justInstalled || o.job?.status === "running";
+      timer = setTimeout(load, 1000);
+    }
+  }
+  root.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("[data-eng]");
+    if (!b) return;
+    const act = b.dataset.eng;
+    if (act === "install") { ui.confirm = true; return paint(); }
+    if (act === "install-no") { ui.confirm = false; return paint(); }
+    if (act === "install-yes") {
+      ui.confirm = false;
+      try { v = await api("/api/voices/install", { method: "POST" }); } catch (e) { toast(e.message); }
+      return load();
+    }
+    if (act === "use") {
+      try { v = await api("/api/voices/use", { json: { engine: b.dataset.id } }); toast(b.dataset.id === "orpheus" ? "Voz com emoção ativada" : "Voz neutra ativada"); }
+      catch (e) { toast(e.message); }
+      return load();
+    }
+    if (act === "sample") {
+      ui.playing = b.dataset.id; paint();
+      try { await speak(VOICE_SAMPLE.text, VOICE_SAMPLE.voice, { engine: b.dataset.id, onStart: () => { ui.playing = ""; paint(); } }); }
+      catch (e) { toast(e.message); }
+      ui.playing = ""; paint();
+    }
+  });
+  paint();
+  load();
+  return { stop() { stopped = true; clearTimeout(timer); } };
 }
 
 // =====================================================================

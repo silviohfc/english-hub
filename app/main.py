@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, llm, metrics, prompts, providers, uninstall
+from . import config, db, llm, metrics, prompts, providers, uninstall, voices
 from . import setup as setup_mod
 from .stt import stt
 from .tts import tts
@@ -43,11 +43,12 @@ def resolve_scenario(sid: str) -> dict:
         c = db.get_custom(int(sid[1:]))
         if c:
             p = c.get("persona") or {}
-            name = p.get("name") or "Alex"
+            v = prompts.voice(p.get("voice"))
+            name = p.get("name") or prompts.CHARACTERS[v]["name"]
             brief = (f"You are {name}, {p.get('role', '')}. Personality: {p.get('style', 'professional')}.\n\n"
                      f"{c.get('persona_brief_en', '')}")
             return {"id": sid, "kind": c["kind"], "title": c.get("title", ""), "title_pt": c.get("title_pt", ""),
-                    "desc_pt": c.get("desc_pt", ""), "persona": name, "voice": p.get("voice", "am_michael"),
+                    "desc_pt": c.get("desc_pt", ""), "persona": name, "voice": v,
                     "brief": brief, "criteria": c.get("success_criteria") or [],
                     "context_en": json.dumps(c.get("briefing_pt") or {}, ensure_ascii=False),
                     "retell_question": c.get("retell_question")}
@@ -58,7 +59,7 @@ def scenario_info(sid: str) -> dict:
     try:
         s = resolve_scenario(sid)
     except HTTPException:
-        return {"id": sid, "title_pt": "(cenário apagado)", "persona": "Partner", "voice": "am_michael", "kind": "?"}
+        return {"id": sid, "title_pt": "(cenário apagado)", "persona": "Partner", "voice": prompts.DEFAULT_VOICE, "kind": "?"}
     return {k: s.get(k) for k in ("id", "kind", "title", "title_pt", "persona", "voice", "retell_question")}
 
 
@@ -88,6 +89,9 @@ def _warmup() -> None:
         log.info("Models missing; waiting for the setup screen.")
         return
 
+    if voices.active() == "orpheus":
+        voices.worker.warm()
+
     def load():
         for name, fn in (("stt", stt.load), ("tts", tts.load)):
             try:
@@ -101,6 +105,7 @@ def _warmup() -> None:
 def _shutdown() -> None:
     for live in LIVE.values():
         live["chat"].close()
+    voices.worker.stop()
 
 
 @app.get("/")
@@ -119,7 +124,8 @@ def status():
             "feedback_model": f"{config.FEEDBACK_PROVIDER}:{config.FEEDBACK_MODEL or 'padrão'}",
             "track": config.TRACK,
             "setup_done": flags["setup_done"], "onboarding_done": flags["onboarding_done"],
-            "installing": setup_mod.job.running}
+            "installing": setup_mod.job.running,
+            "voice_engine": voices.active(), "voice_rtf": voices._mark().get("rtf") if voices.active() == "orpheus" else None}
 
 
 # ---------- first-run setup & settings ----------
@@ -249,7 +255,8 @@ class StartReq(BaseModel):
 async def start_session(req: StartReq):
     scn = resolve_scenario(req.scenario)
     sid = db.create_session(req.scenario, req.level, scn.get("title_pt") or scn.get("title"))
-    system = prompts.chat_system_prompt(scn, req.level, db.watch_items(), db.training_phrases())
+    system = prompts.chat_system_prompt(scn, req.level, db.watch_items(), db.training_phrases(),
+                                        expressive=voices.expressive())
 
     def run():
         chat = llm.ChatProcess(system)
@@ -260,8 +267,10 @@ async def start_session(req: StartReq):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Claude CLI error: {e}") from e
     LIVE[sid] = {"chat": chat, "scenario": req.scenario}
-    db.add_turn(sid, "assistant", opening)
-    return {"session_id": sid, "persona": scn["persona"], "voice": scn["voice"], "reply": opening}
+    # `say` keeps the sound tags (<laugh>...) for the expressive voice; captions and history get clean text.
+    db.add_turn(sid, "assistant", voices.clean(opening))
+    return {"session_id": sid, "persona": scn["persona"], "voice": scn["voice"], "reply": voices.clean(opening),
+            "say": opening}
 
 
 def _live(sid: int) -> dict:
@@ -286,8 +295,9 @@ async def turn(sid: int, audio: UploadFile | None = File(None), text: str | None
         reply = await run_in_threadpool(live["chat"].send, metrics.marked_text(heard["words"], heard["text"]))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Claude CLI error: {e}") from e
-    db.add_turn(sid, "assistant", reply)
-    return {"user": {"text": heard["text"], "words": heard["words"], "metrics": m}, "reply": reply}
+    db.add_turn(sid, "assistant", voices.clean(reply))
+    return {"user": {"text": heard["text"], "words": heard["words"], "metrics": m}, "reply": voices.clean(reply),
+            "say": reply}
 
 
 class EndReq(BaseModel):
@@ -375,12 +385,46 @@ class TTSReq(BaseModel):
     text: str
     voice: str = "af_heart"
     speed: float = 1.0
+    engine: str = ""  # preview a specific engine; default: the active one
 
 
 @app.post("/api/tts")
 async def speak(req: TTSReq):
-    wav = await run_in_threadpool(tts.synth, req.text, req.voice, max(0.6, min(1.4, req.speed)))
-    return Response(wav, media_type="audio/wav")
+    try:
+        wav, meta = await run_in_threadpool(voices.synth, req.text, req.voice, max(0.6, min(1.4, req.speed)),
+                                            req.engine or None)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return Response(wav, media_type="audio/wav", headers={
+        "X-TTS-Engine": meta["engine"], "X-TTS-Speed": "native" if meta["speed_applied"] else "browser",
+        "X-TTS-Fallback": "1" if meta["fallback"] else ""})
+
+
+# ---------- voice engines (Kokoro neutral, Orpheus expressive) ----------
+
+@app.get("/api/voices")
+def voices_overview():
+    return voices.overview()
+
+
+@app.post("/api/voices/install")
+def voices_install():
+    if not voices.support("orpheus")["ok"]:
+        raise HTTPException(409, voices.support("orpheus")["reason"])
+    voices.install.start()
+    return voices.overview()
+
+
+class UseReq(BaseModel):
+    engine: str
+
+
+@app.post("/api/voices/use")
+def voices_use(req: UseReq):
+    try:
+        return voices.use(req.engine)
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
 
 
 @app.post("/api/transcribe")
@@ -458,12 +502,23 @@ def situations():
 
 def _clean_generated(data: dict) -> dict:
     p = data.get("persona") if isinstance(data.get("persona"), dict) else {}
-    if p.get("voice") not in prompts.VOICES:
-        p["voice"] = "am_michael"
-    p.setdefault("name", "Alex")
+    ch = prompts.character(p.get("voice"))
+    # Each voice is one character: keep its name even if the model invented another one.
+    old = (p.get("name") or "").strip()
+    p.update(voice=ch["voice"], name=ch["name"])
+    if not p.get("style"):
+        p["style"] = ch["style"]
     data["persona"] = p
     if not data.get("persona_brief_en"):
         raise llm.LLMError("generated scenario has no persona brief")
+    if old and old != ch["name"]:
+        for key in ("persona_brief_en", "desc_pt"):
+            data[key] = (data.get(key) or "").replace(old, ch["name"])
+        b = data.get("briefing_pt")
+        if isinstance(b, dict):
+            for k, val in b.items():
+                if isinstance(val, str):
+                    b[k] = val.replace(old, ch["name"])
     return data
 
 

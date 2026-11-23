@@ -217,7 +217,7 @@ class Job:
         if self.running:
             return False
         items = [
-            {"id": "kokoro", "group": "voz", "label": "Voz · Kokoro e 10 vozes", "detail": "kokoro-v1.0 · ONNX na CPU"},
+            {"id": "kokoro", "group": "voz", "label": "Voz · Kokoro (21 personagens)", "detail": "kokoro-v1.0 · ONNX na CPU"},
         ]
         for i, name in enumerate(needed_whisper()):
             items.append({"id": f"whisper:{name}", "group": "ouvido",
@@ -301,49 +301,62 @@ class Job:
         if whisper_present(name):
             self._set(item, status="done", detail="já baixado")
             return
-        repo = _whisper_repo(name)
-        total = None
-        try:
-            from huggingface_hub import HfApi
-            info = HfApi().model_info(repo, files_metadata=True)
-            total = sum(s.size or 0 for s in info.siblings
-                        if any(fnmatch.fnmatch(s.rfilename, pat) for pat in WHISPER_FILES)) or None
-        except Exception as e:  # noqa: BLE001
-            log.warning("could not read size of %s: %s", repo, e)
-        self._set(item, status="running", total=total)
-        bars: list = []
-
-        def fetch():
-            # Same files as faster_whisper.utils.download_model, but with a progress hook:
-            # snapshot_download aggregates every file's bytes into one "Reconstructing" bar.
-            import huggingface_hub
-            from tqdm.auto import tqdm
-
-            class Bar(tqdm):
-                def __init__(self, *a, **kw):
-                    kw["file"] = open(os.devnull, "w")  # noqa: SIM115
-                    kw.pop("name", None)
-                    super().__init__(*a, **kw)
-                    bars.append(self)
-
-            try:
-                huggingface_hub.snapshot_download(repo, cache_dir=str(WHISPER_DIR), allow_patterns=WHISPER_FILES,
-                                                  tqdm_class=Bar)
-            except Exception as e:  # noqa: BLE001
-                err.append(e)
-
-        err: list[Exception] = []
-        t = threading.Thread(target=fetch, daemon=True)
-        t.start()
-        while t.is_alive():
-            t.join(0.4)
-            done = [b for b in bars if b.unit == "B" and str(b.desc).startswith("Reconstructing")]
-            if done:
-                got = int(done[0].n)
-                self._set(item, bytes=min(got, total) if total else got, total=total or (done[0].total or None))
-        if err:
-            raise err[0]
+        self._set(item, status="running")
+        total = hf_fetch(_whisper_repo(name), WHISPER_DIR, WHISPER_FILES,
+                         lambda got, tot: self._set(item, bytes=got, total=tot))
         self._set(item, status="done", bytes=total or 0, total=total)
+
+
+
+def hf_size(repo: str, patterns: list[str]) -> int | None:
+    """Bytes of the files matching `patterns` in a Hugging Face repo (None if unknown)."""
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(repo, files_metadata=True)
+        return sum(s.size or 0 for s in info.siblings
+                   if any(fnmatch.fnmatch(s.rfilename, pat) for pat in patterns)) or None
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read size of %s: %s", repo, e)
+        return None
+
+
+def hf_fetch(repo: str, cache_dir: Path, patterns: list[str], progress) -> int | None:
+    """snapshot_download with byte progress: progress(bytes_so_far, total_or_None). Returns the total."""
+    total = hf_size(repo, patterns)
+    progress(0, total)
+    bars: list = []
+    err: list[Exception] = []
+
+    def fetch():
+        # snapshot_download aggregates every file's bytes into one "Reconstructing" bar.
+        import huggingface_hub
+        from tqdm.auto import tqdm
+
+        class Bar(tqdm):
+            def __init__(self, *a, **kw):
+                kw["file"] = open(os.devnull, "w")  # noqa: SIM115
+                kw.pop("name", None)
+                super().__init__(*a, **kw)
+                bars.append(self)
+
+        try:
+            huggingface_hub.snapshot_download(repo, cache_dir=str(cache_dir), allow_patterns=patterns, tqdm_class=Bar)
+        except Exception as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=fetch, daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(0.4)
+        done = [b for b in bars if b.unit == "B" and str(b.desc).startswith("Reconstructing")]
+        if done:
+            got = int(done[0].n)
+            progress(min(got, total) if total else got, total or (done[0].total or None))
+    if err:
+        raise err[0]
+    progress(total or 0, total)
+    return total
+
 
 job = Job()
 

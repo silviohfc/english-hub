@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import config, db, providers
+from . import config, db, providers, voices
 
 log = logging.getLogger("uninstall")
 WIN = sys.platform == "win32"
@@ -49,12 +49,16 @@ def items() -> list[dict]:
     out: list[dict] = []
     kokoro = [f for f in (config.KOKORO_MODEL, config.KOKORO_VOICES) if f.exists()]
     if kokoro:
-        out.append({"id": "model:kokoro", "group": "models", "label": "Voz · Kokoro e 10 vozes",
+        out.append({"id": "model:kokoro", "group": "models", "label": "Voz · Kokoro (21 personagens)",
                     "detail": "síntese de voz", "bytes": sum(_size(f) for f in kokoro), "all": True})
     for r in _whisper_repos():
         name = r.repo_id.split("/")[-1].replace("faster-whisper-", "").replace("faster-distil-whisper-", "distil-")
         out.append({"id": "model:whisper:" + r.repo_id, "group": "models", "label": f"Ouvido · Whisper {name}",
                     "detail": "reconhecimento de fala", "bytes": r.size_on_disk, "all": True})
+    if voices.ORPHEUS_DIR.exists():
+        out.append({"id": "engine:orpheus", "group": "models", "label": "Voz com emoção · Orpheus 3B",
+                    "detail": "modelo, decodificador e o ambiente dele (volta para a voz Kokoro)",
+                    "bytes": voices.size_bytes(), "all": True})
     out.append({"id": "data:db", "group": "data", "label": "Histórico, frases e perfil",
                 "detail": "conversas, frases, caderno de erros, perfil e cenários salvos",
                 "bytes": _size(config.DB_PATH) if config.DB_PATH.exists() else 0, "all": True})
@@ -117,6 +121,8 @@ def run(ids: list[str]) -> dict:
                         from huggingface_hub import scan_cache_dir
                         scan_cache_dir(WHISPER_DIR).delete_revisions(*[x.commit_hash for x in r.revisions]).execute()
                 reset_setup = True
+            elif item_id == "engine:orpheus":
+                voices.remove()
             elif item_id == "data:db":
                 db.wipe()
                 reset_onboarding = True

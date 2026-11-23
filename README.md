@@ -136,7 +136,15 @@ reconhecedor entendeu com baixa confiança (sublinhadas). Isso indica clareza, n
 
 - **Ouvido:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `large-v3-turbo` na GPU (CUDA no Windows,
   Apple Metal/MPS no Mac), com fallback para CPU (modelo `small`).
-- **Voz:** [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) (ONNX, CPU), vozes americanas e britânica.
+- **Voz neutra:** [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) (ONNX, CPU): 21 vozes americanas e
+  britânicas, cada uma um personagem fixo (`CHARACTERS` em `app/prompts.py`). Rápida, mas sempre no mesmo tom.
+- **Voz com emoção (opcional):** [Orpheus 3B](https://github.com/canopyai/Orpheus-TTS) em GGUF via llama.cpp. Ri,
+  suspira e muda a entonação; a IA da conversa marca os sons (`<laugh>`, `<sigh>`...) e as legendas saem sem eles.
+  Instala pelas Configurações → Voz dos personagens, num ambiente Python próprio (`models/engines/orpheus`), e só
+  fica liberada em Mac com Apple Silicon e 16 GB ou mais, ou em placa NVIDIA com 6 GB ou mais (no Windows). Na GTX 1650
+  (4 GB) fica desativada: a VRAM já é do reconhecimento de voz. Tem 8 vozes, então personagens dividem voz. Num M4
+  com 16 GB, gerar a fala leva ~2,7× a duração dela, por isso o app fala frase a frase.
+  Se o Orpheus falhar, a fala volta para a Kokoro sozinha.
 - **Cérebro:** a CLI do seu plano. Claude em modo streaming (Haiku na conversa, Sonnet no feedback); Antigravity
   (`agy -p`) e Codex (`codex exec`) reenviam a conversa a cada fala.
 - **Dados:** SQLite em `data/` (fica fora do git).
@@ -155,6 +163,8 @@ Valem como padrão; o que você escolhe na tela de configuração tem prioridade
 | `WHISPER_DEVICE` | `auto` | `cuda` (Windows), `mps` (Mac), `cpu` ou `auto` |
 | `WHISPER_COMPUTE` | `auto` | `float16`, `int8_float16`, `int8` (auto: `int8_float16` em GPUs ≤ 6 GB) |
 | `WHISPER_CPU_THREADS` | núcleos físicos | threads do Whisper na CPU |
+| `TTS_ENGINE` | `kokoro` | `kokoro` (neutra) ou `orpheus` (com emoção, se instalado e suportado) |
+| `ENGLISH_HUB_ORPHEUS_FORCE` | – | `1` libera o Orpheus mesmo fora dos requisitos (por sua conta) |
 | `PORT` | `8765` | porta do servidor |
 | `ENGLISH_HUB_NO_BROWSER` | – | `1` para não abrir o navegador ao iniciar |
 | `ENGLISH_HUB_DATA` / `ENGLISH_HUB_MODELS` | `data/`, `models/` | pastas de dados e modelos (os nomes antigos `DEV_ENGLISH_*` ainda valem) |

@@ -637,3 +637,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .boot.small .boot-hood { width: 200px; --hood-r: 56px; padding: 36px 22px 20px; }
 .boot.small .boot-title { font-size: var(--fs-lg); }
 .boot.slow .boot-step { color: var(--text); }
+
+/* voice engines: neutral vs expressive */
+.engines { display: grid; gap: 12px; }
+.engine { border: 1px solid var(--line-2); border-radius: 14px; padding: 16px 18px; background: var(--surface); display: grid; gap: 8px; }
+.engine.on { border-color: var(--blue-ink); box-shadow: 0 0 0 3px var(--blue-soft); }
+.engine.off { background: var(--surface-2); border-style: dashed; }
+.engine.off .eng-head b, .engine.off > .d:not(.muted) { color: var(--muted); }
+.engine .eng-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.engine .eng-head b { font-size: var(--fs-md, 1.05rem); margin-right: 4px; }
+.engine .pill .ic { width: 13px; height: 13px; }
+.engine .d { font-size: var(--fs-sm); max-width: 72ch; }
+.engine .eng-off { display: flex; gap: 8px; align-items: flex-start; font-size: var(--fs-sm); color: var(--text); }
+.engine .eng-off .ic { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--muted); }
+.engine .jobs { margin-top: 0; }
+.engine .row { margin-top: 4px; }
