@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -60,7 +61,7 @@ def items() -> list[dict]:
                     "detail": "modelo, decodificador e o ambiente dele (volta para a voz Kokoro)",
                     "bytes": voices.size_bytes(), "all": True})
     out.append({"id": "data:db", "group": "data", "label": "Histórico, frases e perfil",
-                "detail": "conversas, frases, caderno de erros, perfil e cenários salvos",
+                "detail": "conversas, frases (e o áudio delas), caderno de erros, perfil e cenários salvos",
                 "bytes": _size(config.DB_PATH) if config.DB_PATH.exists() else 0, "all": True})
     out.append({"id": "data:settings", "group": "data", "label": "Configurações",
                 "detail": "qualidade, modelos e provedores escolhidos (voltam ao padrão)",
@@ -125,6 +126,7 @@ def run(ids: list[str]) -> dict:
                 voices.remove()
             elif item_id == "data:db":
                 db.wipe()
+                shutil.rmtree(voices.CACHE_DIR, ignore_errors=True)
                 reset_onboarding = True
             elif item_id == "data:settings":
                 config.SETTINGS_PATH.unlink(missing_ok=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 import threading
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -387,49 +388,72 @@ class TTSReq(BaseModel):
     voice: str = "af_heart"
     speed: float = 1.0
     engine: str = ""  # preview a specific engine; default: the active one
+    cache: bool = False  # saved phrases and vocabulary: generate once per engine, then read from disk
 
 
 @app.post("/api/tts")
 async def speak(req: TTSReq):
     try:
         wav, meta = await run_in_threadpool(voices.synth, req.text, req.voice, max(0.6, min(1.4, req.speed)),
-                                            req.engine or None)
+                                            req.engine or None, req.cache)
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
     return Response(wav, media_type="audio/wav", headers={
         "X-TTS-Engine": meta["engine"], "X-TTS-Speed": "native" if meta["speed_applied"] else "browser",
-        "X-TTS-Fallback": "1" if meta["fallback"] else ""})
+        "X-TTS-Fallback": "1" if meta["fallback"] else "", "X-TTS-Cached": "1" if meta["cached"] else ""})
 
 
 class StreamReq(BaseModel):
     text: str
     voice: str = "af_heart"
+    cache: bool = False
+    chunks: list[str] = []  # the line split in sentences by the player (it pauses only between them)
+
+
+def _frame(kind: bytes, data: bytes = b"") -> bytes:
+    return kind + struct.pack("<I", len(data)) + data
 
 
 @app.post("/api/tts/stream")
 async def speak_stream(req: StreamReq, request: Request):
-    """Orpheus line as raw PCM (s16le, mono, 24 kHz), sent while it is generated so playback starts early.
-    Closing the request (the learner interrupted) cancels what is left."""
+    """Orpheus line sent while it is generated, so playback starts early. Framed binary stream:
+    b"P" + u32 length + PCM (s16le, mono, 24 kHz), and b"E" + u32 0 after each sentence.
+    Closing the request (the learner interrupted) cancels what is left. With `cache`, a line already generated is
+    sent from disk at once, and a new one is saved when it finishes."""
+    headers = {"X-TTS-Engine": "orpheus", "X-Sample-Rate": "24000", "Cache-Control": "no-store"}
+    media = "application/octet-stream"
+    if req.cache and voices.orpheus_ok():
+        pcm = await run_in_threadpool(voices.cached_pcm, req.voice, req.text)
+        if pcm:
+            return Response(_frame(b"P", pcm) + _frame(b"E"), media_type=media, headers={**headers, "X-TTS-Cached": "1"})
     try:
-        st = await run_in_threadpool(voices.stream, req.text, req.voice)
+        st = await run_in_threadpool(voices.stream, req.text, req.voice, req.chunks or None)
         it = iter(st)
-        first = await run_in_threadpool(next, it, b"")
+        first = await run_in_threadpool(next, it, None)
     except RuntimeError as e:
         raise HTTPException(503, str(e)) from e
 
     async def body():
+        got, complete = [], False
         try:
-            chunk = first
+            item = first
             # uvicorn doesn't fail the send when the browser hangs up, so check explicitly: an interrupted
             # line must stop generating right away, or the next line waits behind it.
-            while chunk and not await request.is_disconnected():
-                yield chunk
-                chunk = await run_in_threadpool(next, it, b"")
+            while item and not await request.is_disconnected():
+                kind, data = item
+                if kind == "pcm":
+                    got.append(data)
+                    yield _frame(b"P", data)
+                else:
+                    yield _frame(b"E")
+                item = await run_in_threadpool(next, it, None)
+            complete = item is None and not st.cancelled
         finally:
             st.close()
+            if req.cache and complete:
+                await run_in_threadpool(voices.save_pcm, req.voice, req.text, b"".join(got))
 
-    return StreamingResponse(body(), media_type="audio/L16;rate=24000;channels=1",
-                             headers={"X-TTS-Engine": "orpheus", "X-Sample-Rate": "24000", "Cache-Control": "no-store"})
+    return StreamingResponse(body(), media_type=media, headers=headers)
 
 
 # ---------- voice engines (Kokoro neutral, Orpheus expressive) ----------

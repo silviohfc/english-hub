@@ -145,7 +145,9 @@ reconhecedor entendeu com baixa confiança (sublinhadas). Isso indica clareza, n
   (4 GB) fica desativada: a VRAM já é do reconhecimento de voz. Tem 8 vozes, então personagens dividem voz.
   A fala é transmitida enquanto é gerada (`/api/tts/stream`): numa GPU que gera mais rápido que o tempo real
   (ex.: RTX 3060 Ti) ela começa em cerca de 1 s; num M4 com 16 GB (gera em ~2,3× a duração) o app espera um buffer
-  para não engasgar. Interromper o personagem cancela o resto na hora. Entre 0,90× e 1,10× a fala sai na velocidade
+  para não engasgar. O player só pausa entre frases, nunca no meio (num computador bem mais lento que o tempo
+  real, cada frase toca quando fica pronta). Interromper o personagem cancela o resto na hora. Frases salvas e
+  vocabulário são gerados uma vez por motor de voz e ficam em `data/tts-cache/<motor>/`. Entre 0,90× e 1,10× a fala sai na velocidade
   natural; fora disso, ela só começa com a frase pronta. Se o llama.cpp não usar a GPU, o cartão avisa.
   Se o Orpheus falhar, a fala volta para a Kokoro sozinha.
 - **Cérebro:** a CLI do seu plano. Claude em modo streaming (Haiku na conversa, Sonnet no feedback); Antigravity

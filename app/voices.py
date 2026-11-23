@@ -11,6 +11,7 @@ removes them for captions, history and the neutral engine."""
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -35,6 +36,9 @@ ORPHEUS_DIR = config.ENGINES_DIR / "orpheus"
 ORPHEUS_HF = ORPHEUS_DIR / "hf"
 ORPHEUS_MARK = ORPHEUS_DIR / "installed.json"
 ORPHEUS_SR = 24_000
+# Lines that are played again and again (saved phrases, vocabulary) are generated once per engine and kept here:
+# tts-cache/<engine>/<hash>.wav. Conversation lines are never cached.
+CACHE_DIR = config.DATA_DIR / "tts-cache"
 ORPHEUS_PY = ORPHEUS_DIR / ".venv" / ("Scripts/python.exe" if WIN else "bin/python")
 ORPHEUS_FILES = [  # (repo, file)
     ("isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF", "orpheus-3b-0.1-ft-q4_k_m.gguf"),
@@ -165,8 +169,8 @@ def _chunks(text: str) -> list[str]:
     is already queued while the current one plays."""
     parts = [p.strip() for p in re.findall(r"[^.!?…]+(?:[.!?…]+[\"')\]]*|$)", text) if p.strip()]
     out: list[str] = []
-    for p in parts:
-        if out and len(out[-1]) < 40:
+    for p in parts:  # same rule as sentenceChunks() in app.js
+        if out and len(out[-1]) < (15 if len(out) == 1 else 40):
             out[-1] += " " + p
         else:
             out.append(p)
@@ -174,16 +178,17 @@ def _chunks(text: str) -> list[str]:
 
 
 class Stream:
-    """One line being spoken: queued in the worker as sentence chunks, read back as PCM as it is generated."""
+    """One line being spoken: queued in the worker as sentence chunks, read back as it is generated.
+    Yields ("pcm", bytes) and ("end", index) after each sentence, so the player can pause between sentences."""
 
-    def __init__(self, w: "Worker", text: str, voice: str) -> None:
+    def __init__(self, w: "Worker", chunks: list[str], voice: str) -> None:
         self.w, self.ids, self.cancelled = w, [], False
-        for chunk in _chunks(text):
+        for chunk in chunks:
             self.ids.append(w._send({"text": chunk, "voice": voice}))
 
     def __iter__(self):
         try:
-            for rid in self.ids:
+            for i, rid in enumerate(self.ids):
                 q = self.w.queues.get(rid)
                 if q is None:  # closed
                     return
@@ -196,10 +201,11 @@ class Stream:
                     if msg.get("closed"):
                         return
                     if "pcm" in msg:
-                        yield base64.b64decode(msg["pcm"])
+                        yield "pcm", base64.b64decode(msg["pcm"])
                     elif msg.get("done"):
                         self.w._stats(msg)
                         self.w.queues.pop(rid, None)
+                        yield "end", i
                         break
                     else:
                         raise RuntimeError(msg.get("error") or "falha ao gerar a voz")
@@ -207,13 +213,14 @@ class Stream:
             self.close()
 
     def close(self) -> None:
-        """Stop generating what is left (safe to call from any thread, more than once)."""
+        """Stop generating what is left (safe to call from any thread, more than once). `cancelled` tells whether
+        something was still pending, i.e. the line was cut short."""
         for rid in self.ids:
             q = self.w.queues.pop(rid, None)
             if q is not None:
                 q.put({"closed": True})  # wakes a reader blocked on this request
                 self.w._send({"cancel": rid}, raw=True)
-        self.cancelled = True
+                self.cancelled = True
 
 
 class Worker:
@@ -314,22 +321,15 @@ class Worker:
             except Exception:  # noqa: BLE001
                 p.kill()
 
-    def stream(self, text: str, voice: str) -> Stream:
+    def stream(self, text: str, voice: str, chunks: list[str] | None = None) -> Stream:
         self.start()
         if self.state != "ready":
             raise RuntimeError(self.error or "Orpheus indisponível")
-        return Stream(self, text, voice)
+        return Stream(self, chunks or _chunks(text), voice)
 
     def synth(self, text: str, voice: str) -> bytes:
         """The whole line as a WAV (used by the install test and when the speed is not 1×)."""
-        pcm = b"".join(self.stream(text, voice))
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(ORPHEUS_SR)
-            w.writeframes(pcm)
-        return buf.getvalue()
+        return pcm_to_wav(b"".join(data for kind, data in self.stream(text, voice) if kind == "pcm"))
 
 
 worker = Worker()
@@ -339,21 +339,73 @@ def orpheus_ok() -> bool:
     return installed("orpheus") and support("orpheus")["ok"]
 
 
-def stream(text: str, voice: str):
-    """PCM stream (16-bit mono, 24 kHz) of a character's line with Orpheus. Raises before the first byte if the
-    engine can't speak, so the caller can fall back to a WAV."""
+def stream(text: str, voice: str, chunks: list[str] | None = None) -> Stream:
+    """A character's line with Orpheus, generated sentence by sentence (`chunks`, as split by the player, or split
+    here). Raises before anything is generated if the engine can't speak, so the caller can fall back to a WAV."""
     if not orpheus_ok():
         raise RuntimeError("Orpheus não está disponível neste computador.")
     voice = prompts.voice(voice)
-    return worker.stream(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"))
+    parts = [_orpheus_text(c) for c in chunks if c.strip()] if chunks else None
+    return worker.stream(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"), parts)
 
 
-def synth(text: str, voice: str, speed: float = 1.0, engine: str | None = None) -> tuple[bytes, dict]:
-    """WAV bytes for a character's line, plus {"engine", "speed_applied", "fallback"}."""
-    from .tts import tts
+def cache_file(engine: str, voice: str, text: str, speed: float = 1.0) -> Path:
+    # Kokoro bakes the speed into the audio; Orpheus is always natural pace (the browser changes the speed).
+    key = f"{prompts.voice(voice)}|{text.strip()}|{round(speed, 2) if engine == 'kokoro' else ''}"
+    return CACHE_DIR / engine / (hashlib.sha1(key.encode()).hexdigest() + ".wav")
 
+
+def _save(path: Path, wav: bytes) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(wav)
+        tmp.replace(path)
+    except OSError as e:
+        log.warning("cannot cache %s: %s", path.name, e)
+
+
+def pcm_to_wav(pcm: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(ORPHEUS_SR)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def cached_pcm(voice: str, text: str) -> bytes | None:
+    """Orpheus audio of a cached line as raw PCM (for the streaming endpoint), or None."""
+    f = cache_file("orpheus", voice, text)
+    if not f.exists():
+        return None
+    with wave.open(str(f), "rb") as w:
+        return w.readframes(w.getnframes())
+
+
+def save_pcm(voice: str, text: str, pcm: bytes) -> None:
+    _save(cache_file("orpheus", voice, text), pcm_to_wav(pcm))
+
+
+def synth(text: str, voice: str, speed: float = 1.0, engine: str | None = None,
+          cache: bool = False) -> tuple[bytes, dict]:
+    """WAV bytes for a character's line, plus {"engine", "speed_applied", "fallback", "cached"}.
+    With `cache`, the line is generated once per engine and then read from disk."""
     voice = prompts.voice(voice)
     engine = engine or active()
+    f = cache_file(engine, voice, text, speed) if cache else None
+    if f and f.exists():
+        return f.read_bytes(), {"engine": engine, "speed_applied": engine == "kokoro", "fallback": "", "cached": True}
+    wav, meta = _synth(text, voice, speed, engine)
+    if f and not meta["fallback"]:
+        _save(f, wav)
+    return wav, {**meta, "cached": False}
+
+
+def _synth(text: str, voice: str, speed: float, engine: str) -> tuple[bytes, dict]:
+    from .tts import tts
+
     if engine == "orpheus":
         if not orpheus_ok():
             raise RuntimeError("Orpheus não está disponível neste computador.")
@@ -474,9 +526,10 @@ class Install:
         if worker.state != "ready":
             raise RuntimeError(worker.error)
         t0, first, pcm = time.time(), None, 0
-        for chunk in worker.stream("Oh wow, that's great news! <laugh> I'm really happy for you.", "tara"):
-            first = first or time.time() - t0
-            pcm += len(chunk)
+        for kind, chunk in worker.stream("Oh wow, that's great news! <laugh> I'm really happy for you.", "tara"):
+            if kind == "pcm":
+                first = first or time.time() - t0
+                pcm += len(chunk)
         took, seconds = time.time() - t0, pcm / 2 / ORPHEUS_SR
         rtf = took / max(seconds, 0.1)
         ORPHEUS_MARK.write_text(json.dumps({"ok": True, "rtf": round(rtf, 2), "gpu": worker.gpu, "at": time.time()}),
@@ -496,6 +549,7 @@ def remove() -> None:
     if config.TTS_ENGINE == "orpheus":
         config.apply({"tts_engine": "kokoro"})
     shutil.rmtree(ORPHEUS_DIR, ignore_errors=True)
+    shutil.rmtree(CACHE_DIR / "orpheus", ignore_errors=True)
 
 
 def size_bytes() -> int:

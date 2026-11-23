@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -29,9 +30,11 @@ import time
 SR = 24_000
 FRAME = 2048            # samples per SNAC frame (7 audio tokens)
 AUDIO_BASE = 128266     # id of <custom_token_10>, the first audio code
-END_OF_SPEECH = 128258  # <custom_token_2>
-EOT = 128009            # <|eot_id|>
-BLOCKS = (4, 8, 16)     # frames per decoded block: small first, so playback starts early
+# Before the audio the model emits start_of_ai / start_of_speech. After it, it closes its turn and starts a new one
+# (end_of_speech, end_of_ai, start_of_human, text...) that can speak the same line again: once audio has begun, any
+# non-audio token ends the line.
+EOS = {128009, 128001}
+BLOCKS = (3, 6, 8)      # frames per decoded block (~85 ms each): small first so playback starts early, then steady
 
 
 def _protocol_stream():
@@ -52,12 +55,16 @@ def _cuda_dlls() -> None:
 
 
 class Orpheus:
-    def __init__(self, model: str, snac: str, gpu_layers: int) -> None:
+    SAMPLING = {"top_k": 40, "top_p": 0.9, "min_p": 0.05, "temp": 0.6, "repeat_penalty": 1.1}
+
+    def __init__(self, model: str, snac: str, gpu_layers: int, penalty_window: int = 64) -> None:
         import llama_cpp
         import onnxruntime
 
         self.gpu = bool(llama_cpp.llama_supports_gpu_offload()) and gpu_layers != 0
-        self.llm = llama_cpp.Llama(model_path=model, n_ctx=4096, n_gpu_layers=gpu_layers, verbose=False, n_batch=512)
+        self.llm = llama_cpp.Llama(model_path=model, n_ctx=4096, n_gpu_layers=gpu_layers, verbose=False, n_batch=512,
+                                   last_n_tokens_size=penalty_window)
+        self.sampling = dict(self.SAMPLING)
         opts = onnxruntime.SessionOptions()
         opts.intra_op_num_threads = max(2, (os.cpu_count() or 4) // 2)
         self.snac = onnxruntime.InferenceSession(snac, sess_options=opts, providers=["CPUExecutionProvider"])
@@ -79,7 +86,9 @@ class Orpheus:
         """Yield PCM chunks (int16 arrays) for `text` while it is being generated."""
         prompt = self.llm.tokenize(f"<|audio|>{voice}: {text}<|eot_id|><custom_token_4>".encode(),
                                    add_bos=True, special=True)
-        max_tokens = min(3500, 600 + 16 * len(text))  # ~84 tokens per second of speech
+        # ~84 tokens per second of speech; allow about twice the expected length (laughs, slow speakers), never a rerun.
+        spoken = len(re.sub(r"<[^>]+>", "", text))
+        max_tokens = int(84 * (2.5 + 2 * spoken / 13))
         frames: list[list[int]] = []
         state = {"done": False, "error": None, "tokens": 0}
         lock = threading.Lock()
@@ -87,11 +96,14 @@ class Orpheus:
         def generate():
             cur: list[int] = []
             try:
-                for n, tok in enumerate(self.llm.generate(prompt, top_k=40, top_p=0.9, min_p=0.05, temp=0.6,
-                                                          repeat_penalty=1.1, reset=True)):
+                for n, tok in enumerate(self.llm.generate(prompt, reset=True, **self.sampling)):
                     state["tokens"] = n + 1
-                    if tok in (END_OF_SPEECH, EOT) or n >= max_tokens or cancelled():
+                    if n >= max_tokens or cancelled():
                         break
+                    if tok < AUDIO_BASE:
+                        if tok in EOS or frames or cur:
+                            break
+                        continue
                     code = tok - AUDIO_BASE - len(cur) * 4096
                     if not 0 <= code < 4096:
                         continue  # not an audio code (or out of place): skip it like the reference decoder
