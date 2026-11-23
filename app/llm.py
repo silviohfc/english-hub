@@ -84,6 +84,7 @@ class ClaudeChat:
     def __init__(self, system_prompt: str, model: str) -> None:
         args = _claude_args(model, system_prompt) + [
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages",
         ]
         self._proc = subprocess.Popen(
             args, cwd=config.CLAUDE_WORKDIR,
@@ -99,7 +100,14 @@ class ClaudeChat:
             self._stderr.append(line)
             del self._stderr[:-50]
 
+    streaming = True  # the reply arrives token by token (see stream())
+
     def send(self, text: str) -> str:
+        return "".join(self.stream(text)).strip()
+
+    def stream(self, text: str):
+        """Yield the reply as it is written (text deltas from --include-partial-messages). The turn is always read
+        to its end, even if the caller stops early, so the next turn starts clean."""
         with self._lock:
             if self._proc.poll() is not None:
                 raise LLMError("Claude process exited: " + "".join(self._stderr[-5:]))
@@ -107,23 +115,39 @@ class ClaudeChat:
             self._proc.stdin.write(json.dumps(msg) + "\n")
             self._proc.stdin.flush()
             parts: list[str] = []
-            for line in self._proc.stdout:
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") == "assistant":
-                    for block in ev.get("message", {}).get("content", []):
-                        if block.get("type") == "text":
-                            parts.append(block["text"])
-                elif ev.get("type") == "result":
-                    if ev.get("is_error"):
-                        raise LLMError(str(ev.get("result") or ev.get("subtype")))
-                    return (ev.get("result") or "".join(parts)).strip()
-            raise LLMError("Claude process closed unexpectedly: " + "".join(self._stderr[-5:]))
+            streamed, done = False, False
+            try:
+                for line in self._proc.stdout:
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    kind = ev.get("type")
+                    if kind == "stream_event":
+                        delta = (ev.get("event") or {}).get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            streamed = True
+                            yield delta["text"]
+                    elif kind == "assistant" and not streamed:
+                        for block in ev.get("message", {}).get("content", []):
+                            if block.get("type") == "text":
+                                parts.append(block["text"])
+                    elif kind == "result":
+                        done = True
+                        if ev.get("is_error"):
+                            raise LLMError(str(ev.get("result") or ev.get("subtype")))
+                        if not streamed:  # an older CLI without partial messages: the whole reply at once
+                            yield (ev.get("result") or "".join(parts)).strip()
+                        return
+                raise LLMError("Claude process closed unexpectedly: " + "".join(self._stderr[-5:]))
+            finally:
+                if not done and self._proc.poll() is None:
+                    for line in self._proc.stdout:  # drain the rest of this turn
+                        if line.startswith("{") and '"type":"result"' in line.replace(" ", ""):
+                            break
 
     def close(self) -> None:
         try:
@@ -297,7 +321,10 @@ def ask_json(prompt: str, system_prompt: str, model: str | None = None, tools: s
 
 
 class HistoryChat:
-    """Conversation for providers without a long-lived headless mode: each turn sends the dialogue so far."""
+    """Conversation for providers without a long-lived headless mode: each turn sends the dialogue so far.
+    No streaming: the reply arrives whole, so the voice can only start after it."""
+
+    streaming = False
 
     def __init__(self, system_prompt: str, role: str = "chat") -> None:
         self.system, self.role = system_prompt, role
@@ -317,6 +344,9 @@ class HistoryChat:
                 self.turns.append(("user", text))
             self.turns.append(("assistant", reply))
             return reply
+
+    def stream(self, text: str):
+        yield self.send(text)
 
     def close(self) -> None:
         pass

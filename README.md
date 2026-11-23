@@ -143,15 +143,24 @@ reconhecedor entendeu com baixa confiança (sublinhadas). Isso indica clareza, n
   Instala pelas Configurações → Voz dos personagens, num ambiente Python próprio (`models/engines/orpheus`), e só
   fica liberada em Mac com Apple Silicon e 16 GB ou mais, ou em placa NVIDIA com 6 GB ou mais (no Windows). Na GTX 1650
   (4 GB) fica desativada: a VRAM já é do reconhecimento de voz. Tem 8 vozes, então personagens dividem voz.
-  A fala é transmitida enquanto é gerada (`/api/tts/stream`): numa GPU que gera mais rápido que o tempo real
-  (ex.: RTX 3060 Ti) ela começa em cerca de 1 s; num M4 com 16 GB (gera em ~2,3× a duração) o app espera um buffer
-  para não engasgar. O player só pausa entre frases, nunca no meio (num computador bem mais lento que o tempo
-  real, cada frase toca quando fica pronta). Interromper o personagem cancela o resto na hora. Frases salvas e
-  vocabulário são gerados uma vez por motor de voz e ficam em `data/tts-cache/<motor>/`. Entre 0,90× e 1,10× a fala sai na velocidade
-  natural; fora disso, ela só começa com a frase pronta. Se o llama.cpp não usar a GPU, o cartão avisa.
-  Se o Orpheus falhar, a fala volta para a Kokoro sozinha.
-- **Cérebro:** a CLI do seu plano. Claude em modo streaming (Haiku na conversa, Sonnet no feedback); Antigravity
-  (`agy -p`) e Codex (`codex exec`) reenviam a conversa a cada fala.
+  Num M4 com 16 GB o Orpheus gera em ~2,3× a duração da fala, então pausas entre frases são inevitáveis; a
+  Kokoro não tem esse limite. Se o llama.cpp não usar a GPU, o cartão avisa. Se o Orpheus falhar, a fala volta
+  para a Kokoro sozinha.
+- **Voz em streaming (os dois motores):** `app/speech.py` corta o texto em frases assim que cada uma fica completa
+  (a primeira curta, para a voz começar cedo; as seguintes maiores, porque cada corte custa um recomeço no Orpheus),
+  remove o silêncio que o motor põe nas pontas e insere uma pausa pela pontuação. Tudo chega ao navegador no mesmo
+  formato (PCM 24 kHz em quadros), e um player só toca qualquer motor, pausando apenas entre frases. Frases salvas e
+  vocabulário são gerados uma vez por motor e ficam em `data/tts-cache/<motor>/`. Entre 0,90× e 1,10× o Orpheus
+  sai em streaming; fora disso ele usa o WAV (o navegador muda a velocidade sem mudar o tom).
+- **Cérebro:** a CLI do seu plano. Só o **Claude tem streaming**: na chamada, cada fala é um fluxo único
+  (`/api/session/{id}/turn/stream`) com a sua transcrição, o texto da resposta enquanto é escrito e a voz, que começa
+  na primeira frase pronta, antes de a resposta terminar. Antigravity (`agy -p`) e Codex (`codex exec`) reenviam a
+  conversa a cada fala e entregam a resposta inteira, então a voz só começa depois dela.
+- **Chamada:** uma por vez. Ela continua se você abrir outras páginas (uma barra no canto mostra quem está falando,
+  o tempo e os botões de voltar e encerrar), volta depois de recarregar a página e só termina quando você encerra.
+  Falar por cima do personagem corta a voz na hora, mas a resposta continua sendo registrada. Se a resposta demora
+  mais de ~2 s para começar, o personagem faz um "hmm" curto (desliga em Configurações → Conversa). As Configurações
+  → Voz mostram quanto as últimas falas levaram para começar e as maiores pausas no meio.
 - **Dados:** SQLite em `data/` (fica fora do git).
 
 ## Configuração por variáveis de ambiente
@@ -185,7 +194,7 @@ uv run python -m app.main      # abre a configuração inicial no navegador
 Código: `app/main.py` (API), `app/prompts.py` (personas, os dois focos e o método), `app/llm.py` (chamadas às
 CLIs de IA), `app/providers.py` (instalar, entrar, testar e remover as CLIs), `app/uninstall.py` (desinstalação),
 `app/setup.py` (hardware, downloads e configuração inicial), `app/config.py` (configurações salvas),
-`app/stt.py`, `app/tts.py`, `app/metrics.py`, `app/db.py`, `app/static/` (interface).
+`app/stt.py`, `app/tts.py`, `app/speech.py` (voz em streaming), `app/metrics.py`, `app/db.py`, `app/static/` (interface).
 
 ## Próximos passos
 

@@ -27,6 +27,8 @@ ROLES = ("chat", "feedback", "helper")
 PROVIDERS: dict[str, dict] = {
     "claude": {
         "label": "Claude", "cli": "Claude Code", "bin": "claude", "plan": "Assinatura Claude (Pro ou Max)",
+        # Long-lived process with token streaming: the voice starts while the reply is still being written.
+        "streaming": True,
         "models": ["haiku", "sonnet", "opus"],
         "defaults": {"chat": "haiku", "feedback": "sonnet", "helper": "haiku"},
         "install": {"unix": "curl -fsSL https://claude.ai/install.sh | bash",
@@ -39,6 +41,7 @@ PROVIDERS: dict[str, dict] = {
     },
     "gemini": {
         "label": "Gemini", "cli": "Antigravity CLI", "bin": "agy", "plan": "Plano Google AI (Antigravity)",
+        "streaming": False,
         "models": [],
         "defaults": {"chat": "", "feedback": "", "helper": ""},
         "install": {"unix": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -54,6 +57,7 @@ PROVIDERS: dict[str, dict] = {
     },
     "codex": {
         "label": "ChatGPT", "cli": "Codex CLI", "bin": "codex", "plan": "Plano ChatGPT (Plus, Pro ou Business)",
+        "streaming": False,
         "models": [],
         "defaults": {"chat": "", "feedback": "", "helper": ""},
         "install": {"unix": None, "win": "irm https://chatgpt.com/codex/install.ps1 | iex"},
@@ -134,7 +138,8 @@ def state(pid: str) -> dict:
     out = {"id": pid, "label": p["label"], "cli": p["cli"], "plan": p["plan"], "note": p.get("note"),
            "installed": bool(path), "path": path, "version": None, "signed_in": None,
            "test": TESTS.get(pid), "can_install": bool(install_command(pid)),
-           "can_logout": bool(p["logout"]) or bool(p.get("logout_hint")), "task": TASKS.get(pid)}
+           "can_logout": bool(p["logout"]) or bool(p.get("logout_hint")), "task": TASKS.get(pid),
+           "streaming": bool(p.get("streaming"))}
     if path:
         out["version"] = version(pid, path)
         out["method"] = install_method(pid, path)

@@ -35,6 +35,7 @@ const settings = {
   get level() { return store.get("level", "friendly"); },
   get speed() { return store.get("speed", 0.95); },
   get cc() { return store.get("cc", LEGACY_CC[store.get("textMode", "")] || "reveal"); },
+  get fillers() { return store.get("fillers", true); }, // a short "hmm" when the reply is slow to start
 };
 
 const fmtSec = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
@@ -147,136 +148,216 @@ function meter(node, onLevel) {
   tick();
   return () => { cancelAnimationFrame(raf); onLevel(0); try { node.disconnect(an); } catch { /* ignore */ } };
 }
-let speakLevel = null; // set by the call screen to animate the partner's portrait
+let speakLevel = null; // set by the call to animate the partner's portrait (call screen or call bar)
 
 // Voice engine in use ("kokoro" neutral, "orpheus" expressive); kept fresh by pollStatus and the settings page.
 let VOICE_ENGINE = "kokoro";
 let VOICE_RTF = null; // Orpheus: generation time / speech time measured on this computer
 let speakToken = 0;
-let currentStream = null; // a streamed line being played (Orpheus)
-// Orpheus streams at its natural pace; the speed setting only switches to the (slower to start) WAV path when it
-// is far from 1×, because Web Audio can't change the speed without changing the pitch.
-const streamable = (engine) => engine === "orpheus" && Math.abs(settings.speed - 1) <= 0.1;
+let currentStream = null; // a streamed line being played
+// Every engine streams PCM through the same player. Kokoro bakes the speed into the audio on the server; Orpheus has
+// no speed control, so far from 1× it uses the WAV path (the browser slows it down keeping the pitch).
+const streamable = (engine) => engine !== "orpheus" || Math.abs(settings.speed - 1) <= 0.1;
+const SR = 24000;
 
-// Plays a line from /api/tts/stream while it is generated (frames: "P" + u32 + PCM s16le 24 kHz, "E" + u32 0 at
-// the end of each sentence). Buffering adapts to how fast this computer is generating right now, and pauses happen
-// only between sentences, where they sound natural: a sentence starts once the audio already received covers the
-// expected wait for the rest of it (on a computer much slower than real time: once it is complete). If a sentence
-// still runs dry (it came out longer than estimated), it refills once with a bigger margin instead of chopping it.
-async function streamSpeak(text, voice, token, onStart, cache) {
+async function audioRunning() {
   const ctx = audioCtx();
   if (ctx.state !== "running") await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]);
-  if (ctx.state !== "running") throw new Error("audio context not running");
-  const chunks = sentenceChunks(text);
-  const ctrl = new AbortController();
-  const t0 = performance.now();
-  const res = await fetch("/api/tts/stream", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, voice, cache: !!cache, chunks }), signal: ctrl.signal });
-  if (!res.ok) throw new Error("stream unavailable");
-  const out = ctx.createGain();
-  out.connect(ctx.destination);
-  const stopMeter = speakLevel ? meter(out, speakLevel) : null;
-  const prior = VOICE_RTF || 1; // generation seconds per second of speech, measured on earlier lines
-  // Per sentence: expected seconds of speech (~13 characters/s, with margin), received seconds, complete?
-  const sent = chunks.map((c) => ({ exp: Math.max(0.8, c.replace(/<[^>]+>/g, "").length / 13) * 1.15, got: 0, done: false }));
-  let received = 0, end = 0, started = false, stopped = false, si = 0, playing = -1, floor = 0.6;
-  const queue = []; // [{buf, s}] not yet scheduled
-  const sources = [];
-  const stream = { stop() { stopped = true; ctrl.abort(); sources.forEach((x) => { try { x.stop(); } catch { /* ignore */ } }); } };
-  currentStream = stream;
-  const rate = () => { // speech seconds generated per wall second: the prior first, then this line's real pace
-    const live = received / Math.max((performance.now() - t0) / 1000, 0.05), w = Math.min(1, received / 2);
-    return Math.max(0.05, w * live + (1 - w) / prior);
-  };
-  // Can sentence `s` play from here without running dry before its end?
-  const ready = (s) => {
-    const x = sent[s];
+  return ctx.state === "running";
+}
+function pcmBuffer(bytes, off, len) {
+  const ctx = audioCtx();
+  const n = len >> 1, dv = new DataView(bytes.buffer, bytes.byteOffset + off, n * 2), f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = dv.getInt16(i * 2, true) / 32768;
+  const buf = ctx.createBuffer(1, Math.max(1, n), SR);
+  buf.copyToChannel(f, 0);
+  return buf;
+}
+
+// One player for every engine and every endpoint. Reads framed streams:
+//   "J" + u32 + JSON event, "P" + u32 + PCM s16le 24 kHz, "E" + u32 0 at the end of each spoken piece.
+// A {"type":"piece","text"} event announces each piece before its audio, so the player knows how long it should be.
+// Buffering adapts to how fast this computer is generating right now, and pauses happen only between pieces, where
+// they sound natural: a piece starts once the audio already received covers the expected wait for the rest of it
+// (on a computer much slower than real time: once it is complete). If a piece still runs dry, it refills once with a
+// bigger margin instead of chopping it. `stats` records what the learner actually heard (first sound, gaps).
+class PcmPlayer {
+  constructor({ token, onStart, onEvent, t0 } = {}) {
+    this.token = token; this.onStart = onStart; this.onEvent = onEvent;
+    this.ctx = audioCtx();
+    this.t0 = t0 ?? performance.now();
+    this.out = this.ctx.createGain();
+    this.out.connect(this.ctx.destination);
+    this.stopMeter = speakLevel ? meter(this.out, (l) => speakLevel?.(l)) : null;
+    this.prior = VOICE_ENGINE === "orpheus" ? VOICE_RTF || 1 : 0.2; // generation seconds per second of speech
+    this.pieces = []; // {exp, got, done}
+    this.queue = []; // [{buf, s}] not yet scheduled
+    this.sources = [];
+    this.received = 0; this.end = 0; this.started = false; this.muted = false; this.si = 0; this.playing = -1; this.floor = 0.6;
+    this.firstAudioAt = null;
+    this.stats = { first_sound_s: null, gaps: 0, gap_max_s: 0, gap_total_s: 0, underruns: 0, played_s: 0 };
+    this.tick = setInterval(() => this.pump(), 100);
+  }
+  get live() { return !this.muted && this.token === speakToken; }
+  // Stop the sound (the learner interrupted); events keep being read if the stream continues.
+  mute() {
+    this.muted = true;
+    this.queue = [];
+    this.sources.forEach((x) => { try { x.stop(); } catch { /* ignore */ } });
+  }
+  // Seconds of sound already scheduled but not yet heard.
+  ahead() { return Math.max(0, this.end - this.ctx.currentTime); }
+  rate() { // speech seconds generated per wall second: the prior first, then this line's real pace
+    if (this.firstAudioAt == null) return 1 / this.prior;
+    const live = this.received / Math.max((performance.now() - this.firstAudioAt) / 1000 + 0.1, 0.05), w = Math.min(1, this.received / 2);
+    return Math.max(0.05, w * live + (1 - w) / this.prior);
+  }
+  ready(s) { // can piece `s` play from here without running dry before its end?
+    const x = this.pieces[s];
     if (!x || x.done) return true;
-    const r = rate();
-    // Much slower than real time: no estimate is safe, so a sentence plays only once it is complete.
-    if (r < 0.75) return false;
+    const r = this.rate();
+    if (r < 0.75) return false; // much slower than real time: no estimate is safe, so a piece plays only once complete
     x.exp = Math.max(x.exp, x.got * 1.25);
-    const queued = queue.filter((q) => q.s === s).reduce((a, q) => a + q.buf.duration, 0);
-    return queued >= (x.exp - x.got) * Math.max(0, 1 - r) * 1.5 + floor;
-  };
-  const schedule = (buf) => {
-    const src = ctx.createBufferSource();
+    const queued = this.queue.filter((q) => q.s === s).reduce((a, q) => a + q.buf.duration, 0);
+    return queued >= (x.exp - x.got) * Math.max(0, 1 - r) * 1.5 + this.floor;
+  }
+  // Play a sound before the line (a short "hmm" while the reply is still on its way). Only before the line starts.
+  prepend(buf) {
+    if (this.started || !this.live) return false;
+    this.schedule(buf, true);
+    return true;
+  }
+  schedule(buf, filler = false) {
+    const src = this.ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(out);
-    const at = Math.max(end, ctx.currentTime + 0.04);
+    src.connect(this.out);
+    const now = this.ctx.currentTime;
+    const at = Math.max(this.end, now + 0.04);
+    if (!this.started) { this.started = true; this.onStart?.(); }
+    if (filler) {
+      this.fillerUntil = at + buf.duration;
+    } else if (this.stats.first_sound_s == null) {
+      this.stats.first_sound_s = +((performance.now() - this.t0) / 1000 + (at - now)).toFixed(3);
+    } else if (at - this.end > 0.06) {
+      const gap = at - this.end; // the learner heard silence the text didn't ask for
+      this.stats.gaps++; this.stats.gap_total_s += gap; this.stats.gap_max_s = Math.max(this.stats.gap_max_s, gap);
+    }
     src.start(at);
-    end = at + buf.duration;
-    sources.push(src);
-  };
-  const pump = () => {
-    while (queue.length && !stopped && token === speakToken) {
-      const { buf, s } = queue[0];
-      const dry = started && ctx.currentTime >= end - 0.02;
-      if (s !== playing || dry) {
-        // A new sentence (flows right on if it can play through, otherwise pauses at the boundary) or a refill
-        // after running dry mid-sentence (with a bigger margin): wait until it can play to its end.
-        if (dry && s === playing) floor = 1.2;
-        if (!ready(s)) return;
-        playing = s;
+    this.end = at + buf.duration;
+    if (!filler) this.stats.played_s += buf.duration;
+    this.sources.push(src);
+  }
+  pump() {
+    while (this.queue.length && this.live) {
+      const { buf, s } = this.queue[0];
+      const dry = this.started && this.ctx.currentTime >= this.end - 0.02 && this.playing >= 0;
+      if (s !== this.playing || dry) {
+        // A new piece (flows right on if it can play through, otherwise pauses at the boundary) or a refill after
+        // running dry mid-piece (with a bigger margin): wait until it can play to its end.
+        if (dry && s === this.playing) { this.floor = 1.2; this.stats.underruns++; }
+        if (!this.ready(s)) return;
+        this.playing = s;
       }
-      queue.shift();
-      if (!started) { started = true; onStart?.(); }
-      schedule(buf);
+      this.queue.shift();
+      this.schedule(buf);
     }
-  };
-  const tick = setInterval(pump, 100);
-  try {
-    const reader = res.body.getReader();
-    let rest = new Uint8Array(0);
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done || stopped || token !== speakToken) break;
-      const bytes = new Uint8Array(rest.length + value.length);
-      bytes.set(rest); bytes.set(value, rest.length);
-      let off = 0;
-      while (bytes.length - off >= 5) {
-        const kind = bytes[off], len = new DataView(bytes.buffer, off + 1, 4).getUint32(0, true);
-        if (bytes.length - off - 5 < len) break;
-        if (kind === 69) { if (sent[si]) sent[si].done = true; si++; } // "E": sentence finished
-        else if (len >= 2) {
-          const n = len >> 1, dv = new DataView(bytes.buffer, off + 5, n * 2), f = new Float32Array(n);
-          for (let i = 0; i < n; i++) f[i] = dv.getInt16(i * 2, true) / 32768;
-          const buf = ctx.createBuffer(1, n, 24000);
-          buf.copyToChannel(f, 0);
-          received += buf.duration;
-          if (sent[si]) sent[si].got += buf.duration;
-          queue.push({ buf, s: Math.min(si, sent.length - 1) });
+  }
+  frame(kind, bytes, off, len) {
+    if (kind === 74) { // "J"
+      let ev = null;
+      try { ev = JSON.parse(new TextDecoder().decode(bytes.subarray(off, off + len))); } catch { return; }
+      if (ev.type === "piece") {
+        const chars = (ev.text || "").length;
+        this.pieces.push({ exp: Math.max(0.6, chars / 13) * 1.15, got: 0, done: false });
+        this.si = this.pieces.length - 1;
+      }
+      this.onEvent?.(ev);
+    } else if (kind === 69) { // "E": piece finished
+      if (this.pieces[this.si]) this.pieces[this.si].done = true;
+    } else if (kind === 80 && len >= 2 && !this.muted) { // "P"
+      if (!this.pieces.length) this.pieces.push({ exp: 3, got: 0, done: false }); // cached line: one piece
+      const buf = pcmBuffer(bytes, off, len);
+      if (this.firstAudioAt == null) this.firstAudioAt = performance.now();
+      this.received += buf.duration;
+      this.pieces[this.si].got += buf.duration;
+      this.queue.push({ buf, s: this.si });
+    }
+  }
+  // Read a framed response to its end, then wait for the sound to finish.
+  async consume(res) {
+    try {
+      const reader = res.body.getReader();
+      let rest = new Uint8Array(0);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const bytes = new Uint8Array(rest.length + value.length);
+        bytes.set(rest); bytes.set(value, rest.length);
+        let off = 0;
+        while (bytes.length - off >= 5) {
+          const kind = bytes[off], len = new DataView(bytes.buffer, off + 1, 4).getUint32(0, true);
+          if (bytes.length - off - 5 < len) break;
+          this.frame(kind, bytes, off + 5, len);
+          off += 5 + len;
         }
-        off += 5 + len;
+        rest = bytes.slice(off);
+        this.pump();
       }
-      rest = bytes.slice(off);
-      pump();
+      this.pieces.forEach((x) => (x.done = true));
+      this.pump();
+      while (this.live && (this.queue.length || this.ctx.currentTime < this.end)) { this.pump(); await new Promise((r) => setTimeout(r, 80)); }
+    } finally {
+      this.close();
     }
-    sent.forEach((x) => (x.done = true));
-    pump();
-    while (!stopped && token === speakToken && (queue.length || ctx.currentTime < end)) { pump(); await new Promise((r) => setTimeout(r, 80)); }
+  }
+  close() {
+    clearInterval(this.tick);
+    this.stopMeter?.(); this.stopMeter = null;
+    this.stats.gap_total_s = +this.stats.gap_total_s.toFixed(3);
+    this.stats.gap_max_s = +this.stats.gap_max_s.toFixed(3);
+    this.stats.played_s = +this.stats.played_s.toFixed(2);
+  }
+}
+
+// Plays a whole line from /api/tts/stream (any engine) while it is generated.
+async function streamSpeak(text, voice, token, onStart, cache, engine) {
+  if (!(await audioRunning())) throw new Error("audio context not running");
+  const ctrl = new AbortController();
+  const player = new PcmPlayer({ token, onStart });
+  const stream = { stop() { ctrl.abort(); player.mute(); } };
+  currentStream = stream;
+  try {
+    const res = await fetch("/api/tts/stream", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice, cache: !!cache, speed: settings.speed, engine: engine || "" }), signal: ctrl.signal });
+    if (!res.ok) throw new Error("stream unavailable");
+    await player.consume(res);
   } catch (e) {
     // Before the first sound, let the caller fall back to the WAV path; after it, just end the line.
-    if (!stopped && e.name !== "AbortError" && !started) throw e;
+    if (e.name !== "AbortError" && !player.started && token === speakToken) throw e;
   } finally {
-    clearInterval(tick);
-    stopMeter?.();
+    player.close();
     if (currentStream === stream) currentStream = null;
   }
 }
 
-// A slow expressive engine speaks sentence by sentence: the next one is generated while the current one plays.
-function sentenceChunks(text) {
-  // The first sentence stays on its own (it decides when the voice starts); later ones are grouped to ~40 characters.
-  const parts = (text.match(/[^.!?…]+(?:[.!?…]+["')\]]*|$)\s*/g) || [text]).map((x) => x.trim()).filter(Boolean);
-  const out = [];
-  for (const p of parts) {
-    const last = out[out.length - 1];
-    if (last !== undefined && last.length < (out.length === 1 ? 15 : 40)) out[out.length - 1] += " " + p;
-    else out.push(p);
+// A short sound as an AudioBuffer (generated once per voice and engine, then read from the cache).
+async function soundBuffer(text, voice) {
+  const res = await fetch("/api/tts/stream", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice, cache: true, speed: 1 }) });
+  if (!res.ok) throw new Error("no sound");
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const parts = [];
+  for (let off = 0; bytes.length - off >= 5;) {
+    const kind = bytes[off], len = new DataView(bytes.buffer, off + 1, 4).getUint32(0, true);
+    if (kind === 80) parts.push(bytes.subarray(off + 5, off + 5 + len));
+    off += 5 + len;
   }
-  return out.length ? out : [text];
+  const all = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let o = 0;
+  for (const p of parts) { all.set(p, o); o += p.length; }
+  return all.length >= 2 ? pcmBuffer(all, 0, all.length) : null;
 }
+
 async function ttsAudio(text, voice, engine, cache) {
   const res = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, voice, speed: settings.speed, engine: engine || "", cache: !!cache }) });
@@ -298,7 +379,7 @@ async function playAudio(audio) {
     try {
       const src = audioCtx().createMediaElementSource(audio);
       src.connect(audioCtx().destination);
-      stopMeter = meter(src, speakLevel);
+      stopMeter = meter(src, (l) => speakLevel?.(l));
     } catch { /* metering is optional */ }
   }
   await audio.play().catch(() => {});
@@ -307,13 +388,24 @@ async function playAudio(audio) {
     audio.onended = done; audio.onpause = done;
   });
 }
+// A slow expressive engine on the WAV path speaks sentence by sentence: the next one is generated while one plays.
+function sentenceChunks(text) {
+  const parts = (text.match(/[^.!?…]+(?:[.!?…]+["')\]]*|$)\s*/g) || [text]).map((x) => x.trim()).filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    const last = out[out.length - 1];
+    if (last !== undefined && last.length < (out.length === 1 ? 15 : 120)) out[out.length - 1] += " " + p;
+    else out.push(p);
+  }
+  return out.length ? out : [text];
+}
 // Speak a character's line. `engine` previews a specific engine; `onStart` fires when the sound actually begins;
 // `cache` (saved phrases, vocabulary) generates the line once per engine and replays it from disk afterwards.
 async function speak(text, voice, { engine, onStart, cache } = {}) {
   stopAudio();
   const token = speakToken;
   if (streamable(engine || VOICE_ENGINE)) {
-    try { return await streamSpeak(text, voice, token, onStart, cache); }
+    try { return await streamSpeak(text, voice, token, onStart, cache, engine); }
     catch (e) { if (token !== speakToken) return; /* otherwise fall back to the WAV path below */ }
   }
   const parts = (engine || VOICE_ENGINE) === "orpheus" && !cache ? sentenceChunks(text) : [text];
@@ -413,7 +505,7 @@ const NAV = [["home", "Praticar", "mic"], ["phrases", "Minhas frases", "star"], 
   ["notebook", "Caderno de erros", "list"], ["profile", "Perfil", "user"]];
 $("#nav").innerHTML = NAV.map(([id, label, icon]) => `<a href="#${id}" data-nav="${id}">${ic(icon)}<span>${label}</span></a>`).join("");
 $("#settings-link").innerHTML = ic("settings");
-const NAV_OWNER = { settings: "settings", uninstall: "settings", home: "home", jobs: "home", situations: "home", classics: "home", brief: "home", chat: "home", report: "history",
+const NAV_OWNER = { settings: "settings", uninstall: "settings", home: "home", jobs: "home", situations: "home", classics: "home", brief: "home", chat: "home", call: "home", report: "history",
   retell: "history", phrases: "phrases", train: "phrases", history: "history", notebook: "notebook", profile: "profile" };
 
 async function pollStatus() {
@@ -456,11 +548,13 @@ let bootTimer = booting ? setInterval(() => {
   if (i === BOOT_STEPS.length - 1) el.closest(".boot")?.classList.add("slow");
 }, 2600) : null;
 
+let callRestored = false;
 async function route() {
   if (cleanup) { cleanup(); cleanup = null; }
-  stopAudio();
+  if (!CALL) stopAudio(); // a call keeps talking while the learner looks at other pages
   const [name, arg, arg2] = (location.hash.slice(1) || "home").split("/");
   if (!FLAGS) FLAGS = await api("/api/status").catch(() => ({ setup_done: true, onboarding_done: true }));
+  if (!callRestored && FLAGS.setup_done) { callRestored = true; await restoreCall(); }
   // First run: setup before anything else, then the introduction (skippable).
   if (!FLAGS.setup_done && name !== "setup") { location.hash = "setup"; return; }
   if (FLAGS.setup_done && !FLAGS.onboarding_done && name === "home") { location.hash = "onboard/mic"; return; }
@@ -475,7 +569,7 @@ async function route() {
   }
   window.scrollTo({ top: 0 });
   const pages = { home: renderHome, jobs: renderJobs, situations: renderSituations, classics: renderClassics, brief: renderBrief,
-    chat: renderChat, report: renderReport, retell: renderRetell, phrases: renderPhrases, train: renderTrain,
+    chat: renderChat, call: renderChat, report: renderReport, retell: renderRetell, phrases: renderPhrases, train: renderTrain,
     history: renderHistory, notebook: renderNotebook, profile: renderProfile,
     setup: renderSetup, onboard: renderOnboard, settings: renderSettings, uninstall: renderUninstall };
   try {
@@ -513,6 +607,7 @@ async function generate(msg, promise) {
 
 let pendingScenario = null;
 async function startScenario(id) {
+  if (CALL) { location.hash = String(CALL.scenario.id) === String(id) ? "call" : "chat/" + id; return; } // one call at a time
   if (String(id).startsWith("c")) {
     const c = await api("/api/custom/" + String(id).slice(1));
     pendingScenario = { id, title_pt: c.title_pt, title: c.title, persona: c.persona?.name, role: c.persona?.role, voice: c.persona?.voice, briefing: c };
@@ -740,23 +835,292 @@ async function renderBrief(id) {
 }
 
 // =====================================================================
-// conversation: a scene with subtitles
+// the call: one at a time. It lives outside the page, so the learner can look at other pages while it goes on
+// (a bar follows them around), and it lasts until it is ended explicitly.
 // =====================================================================
 const CC_MODES = [["off", "Sem legenda"], ["reveal", "Sob demanda"], ["on", "Sempre"]];
+let CALL = null;
+// Short neutral sounds the partner makes when the reply is slow to start (generated once per voice, then cached).
+const CALL_FILLERS = ["Hmm...", "Mm-hmm..."];
+const FILLER_AFTER_MS = 1800;
+const STREAM_INFO = {
+  on: "Claude em modo streaming: a voz começa enquanto a resposta ainda está sendo escrita, e a legenda aparece aos poucos.",
+  off: "Sem streaming neste provedor: a voz só começa quando a resposta inteira chega. Com o Claude na Conversa, as respostas começam mais rápido.",
+};
+const streamPill = (on) => `<span class="pill ${on ? "ok" : "warn"} stream-pill" title="${esc(on ? STREAM_INFO.on : STREAM_INFO.off)}">${ic(on ? "sparkles" : "clock")}${on ? "Streaming" : "Sem streaming"}</span>`;
 
+function newCall(scenario) {
+  return { scenario, session: null, turns: [], lastAssistant: "", lastSay: "", revealed: false, you: null,
+    t0: Date.now(), listening: { reveals: 0, replays: 0 }, state: "connecting", note: "", turnId: 0,
+    view: null, fillers: [], fillerLast: false, rec: new Recorder(), ending: false };
+}
+const canTalk = (c) => c && !c.ending && ["idle", "speaking", "preparing"].includes(c.state);
+function callHint(c, short = false) {
+  const p = esc(c.scenario.persona);
+  const space = short ? "" : " ou segure <kbd>Espaço</kbd>";
+  return ({
+    connecting: "Conectando…",
+    thinking: `${p} está pensando…`,
+    transcribing: "Transcrevendo…",
+    preparing: `${p} vai falar…`,
+    speaking: short ? `${p} está falando` : `${p} está falando… você já pode responder`,
+    recording: short ? "Gravando…" : "Gravando… clique de novo ou solte <kbd>Espaço</kbd> para enviar",
+    ending: "Gerando seu feedback… cerca de 30 segundos",
+    lost: "A chamada caiu (o servidor reiniciou). Encerre para ver o feedback.",
+  })[c.state] || (c.note ? esc(c.note) : short ? "Sua vez de falar" : `Clique no microfone${space} para falar`);
+}
+function setCallState(c, state, note = "") {
+  if (CALL !== c) return;
+  c.state = state;
+  c.note = note;
+  c.view?.sync();
+  paintCallBar();
+}
+const callElapsed = (c) => fmtSec(Math.floor((Date.now() - c.t0) / 1000)).padStart(5, "0");
+setInterval(() => {
+  if (!CALL) return;
+  const t = callElapsed(CALL);
+  $$("[data-call-time]").forEach((el) => (el.textContent = t));
+}, 1000);
+
+// The partner's audio level drives the portrait on the call screen, or the one in the call bar.
+function callLevel(l) {
+  const v = l.toFixed(3);
+  $$("[data-call-level]").forEach((el) => el.style.setProperty("--lvl", v));
+}
+
+// ---- call bar: shown on every page except the call itself ----
+function paintCallBar() {
+  const bar = $("#callbar");
+  if (!bar) return;
+  const c = CALL;
+  if (!c || c.view) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
+  bar.classList.remove("hidden");
+  bar.classList.toggle("speaking", c.state === "speaking");
+  bar.innerHTML = `<a class="cb-main" href="#call" aria-label="Voltar para a chamada com ${esc(c.scenario.persona)}">
+      <span class="cb-face" data-call-level style="--lvl:0"><span class="ring" aria-hidden="true"></span>${avatar(c.scenario.voice, c.scenario.persona)}</span>
+      <span class="cb-text"><span class="cb-name"><span class="live-dot" aria-hidden="true"></span>${esc(c.scenario.persona)}
+        <span class="num faint" data-call-time>${callElapsed(c)}</span></span>
+        <span class="cb-state">${callHint(c, true)}</span></span></a>
+    <div class="cb-acts">
+      <a class="btn btn-sm" href="#call">${ic("phone")} Voltar</a>
+      <button class="btn btn-sm btn-danger" data-call-end ${c.ending ? "disabled" : ""}>${ic("x")} Encerrar</button>
+    </div>`;
+}
+document.addEventListener("click", (e) => { if (e.target.closest("[data-call-end]")) { e.preventDefault(); endCall(); } });
+
+// ---- lifecycle ----
+async function startCall(scenario) {
+  const c = newCall(scenario);
+  CALL = c;
+  speakLevel = callLevel;
+  paintCallBar();
+  const res = await fetch("/api/session/start", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario: scenario.id, level: settings.level }) }).catch((e) => ({ ok: false, status: 0, error: e }));
+  let body = null;
+  try { body = await res.json(); } catch { /* ignore */ }
+  if (!res.ok) {
+    if (CALL === c) { CALL = null; speakLevel = null; }
+    if (res.status === 409 && body?.active) {
+      await restoreCall();
+      toast(body.detail);
+      if (location.hash === "#call") route(); else location.hash = "call";
+      return;
+    }
+    c.view?.fail("Não conectou: " + (body?.detail || res.error?.message || res.statusText));
+    paintCallBar();
+    return;
+  }
+  if (CALL !== c) return;
+  c.session = body;
+  currentVoice = body.voice;
+  c.view?.sync();
+  await callTurn(c, { start: true });
+  loadFillers(c); // after the opening line: a slow engine shouldn't make the greeting wait behind a "hmm"
+}
+
+async function loadFillers(c) {
+  if (!settings.fillers) return;
+  c.fillers = (await Promise.all(CALL_FILLERS.map((t) => soundBuffer(t, c.session.voice).catch(() => null)))).filter(Boolean);
+}
+
+// After a reload, the call still running on the server comes back (without sound until the next turn).
+async function restoreCall() {
+  const r = await api("/api/call").catch(() => null);
+  const a = r?.active;
+  if (!a) return;
+  if (CALL?.session?.session_id === a.session_id) return;
+  const info = a.scenario_info || {};
+  const scenario = { id: a.scenario, title_pt: info.title_pt, title: info.title, persona: a.persona, voice: a.voice, role: info.title_pt };
+  if (String(a.scenario).startsWith("c")) {
+    try {
+      const b = await api("/api/custom/" + String(a.scenario).slice(1));
+      Object.assign(scenario, { briefing: b, role: b.persona?.role });
+    } catch { /* the drawer is optional */ }
+  }
+  const c = newCall(scenario);
+  c.session = { session_id: a.session_id, voice: a.voice, persona: a.persona, streaming: a.streaming };
+  c.t0 = a.started_at * 1000;
+  c.turns = a.turns;
+  const last = [...a.turns].reverse().find((t) => t.role === "assistant");
+  c.lastAssistant = c.lastSay = last?.text || "";
+  c.state = "idle";
+  CALL = c;
+  speakLevel = callLevel;
+  currentVoice = a.voice;
+  loadFillers(c);
+  paintCallBar();
+}
+
+async function endCall() {
+  const c = CALL;
+  if (!c || c.ending) return;
+  if (!confirm(`Encerrar a chamada com ${c.scenario.persona} e gerar o feedback?`)) return;
+  c.ending = true;
+  stopAudio();
+  if (c.rec.active) await c.rec.stop();
+  if (!c.session) { CALL = null; speakLevel = null; paintCallBar(); location.hash = "home"; return; }
+  setCallState(c, "ending");
+  try {
+    await api(`/api/session/${c.session.session_id}/end`, { json: { ...c.listening, text_mode: { off: "real", reveal: "reveal", on: "visible" }[settings.cc] } });
+    CALL = null;
+    speakLevel = null;
+    paintCallBar();
+    location.hash = "report/" + c.session.session_id;
+  } catch (e) {
+    c.ending = false;
+    setCallState(c, "idle", "Erro ao gerar o feedback: " + e.message);
+  }
+}
+
+// One turn: the learner's audio goes up, and the reply comes back as one stream (transcription, the reply's text
+// as it is written, and its voice), so the partner starts talking while the reply is still being written.
+async function callTurn(c, { blob = null, start = false } = {}) {
+  const sid = c.session.session_id;
+  const id = ++c.turnId;
+  const mine = () => CALL === c && c.turnId === id;
+  const withVoice = streamable(VOICE_ENGINE) && (await audioRunning());
+  stopAudio();
+  const token = speakToken;
+  const fd = new FormData();
+  if (blob) fd.append("audio", blob, blobName(blob));
+  if (start) fd.append("start", "true");
+  fd.append("speed", String(settings.speed));
+  fd.append("voice", withVoice ? "true" : "false");
+  setCallState(c, start ? "thinking" : "transcribing");
+  let reply = null, serverStats = null, failed = "", fillerTimer = null, firstText = true;
+  const player = new PcmPlayer({ token, onStart: () => mine() && setCallState(c, "speaking"), onEvent: (ev) => {
+    if (ev.type === "user") {
+      c.turns.push({ role: "user", text: ev.user.text });
+      c.you = ev.user;
+      c.view?.showYou();
+      c.view?.renderLines();
+      if (mine()) setCallState(c, "thinking");
+      // A long silence before the reply sounds like a dropped call: fill it with a short "hmm", not two in a row.
+      if (withVoice && settings.fillers && c.fillers.length && !c.fillerLast) {
+        fillerTimer = setTimeout(() => {
+          const buf = c.fillers[Math.floor(Math.random() * c.fillers.length)];
+          if (mine() && player.prepend(buf)) c.fillerLast = true;
+        }, FILLER_AFTER_MS);
+      }
+    } else if (ev.type === "text") {
+      if (firstText) { firstText = false; c.revealed = false; if (mine() && c.state === "thinking") setCallState(c, "preparing"); }
+      c.lastAssistant = ev.text;
+      c.view?.renderSubtitle();
+    } else if (ev.type === "reply") {
+      reply = ev;
+      c.lastAssistant = ev.reply;
+      c.lastSay = ev.say;
+      c.turns.push({ role: "assistant", text: ev.reply });
+      c.view?.renderSubtitle();
+      c.view?.renderLines();
+    } else if (ev.type === "stats") serverStats = ev.stats;
+    else if (ev.type === "empty") failed = "Não ouvi nada. Fale mais perto do microfone e tente de novo.";
+    else if (ev.type === "error") failed = ev.message;
+  } });
+  // The learner started talking over the partner: silence the voice, keep the text coming.
+  let turnNo = null; // the server's id for this turn, so a late "hush" can never silence the next one
+  const stream = { stop() {
+    player.mute();
+    if (turnNo) fetch(`/api/session/${sid}/hush?turn=${turnNo}`, { method: "POST" }).catch(() => {});
+  } };
+  currentStream = stream;
+  try {
+    const res = await fetch(`/api/session/${sid}/turn/stream`, { method: "POST", body: fd });
+    turnNo = res.headers.get("X-Turn");
+    if (player.muted && turnNo) stream.stop(); // interrupted before the answer started
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).detail || msg; } catch { /* ignore */ }
+      if (res.status === 404) { setCallState(c, "lost"); return; }
+      throw new Error(msg);
+    }
+    await player.consume(res);
+  } catch (e) {
+    failed = failed || e.message;
+  } finally {
+    clearTimeout(fillerTimer);
+    player.close();
+    if (currentStream === stream) currentStream = null;
+  }
+  c.fillerLast = player.fillerUntil != null; // this turn used a "hmm": the next one won't
+  if (!mine()) return;
+  if (!reply) { setCallState(c, "idle", failed ? (failed.startsWith("Não ouvi") ? failed : "Erro: " + failed) : ""); return; }
+  // No voice in the stream (Orpheus far from 1×, the audio was blocked, or the voice failed): speak it now.
+  if (!player.muted && token === speakToken && !player.stats.played_s) {
+    setCallState(c, VOICE_ENGINE === "orpheus" ? "preparing" : "speaking");
+    try { await speak(reply.say, c.session.voice, { onStart: () => mine() && setCallState(c, "speaking") }); }
+    catch (e) { toast("Voz: " + e.message); }
+  }
+  if (serverStats) {
+    api("/api/voice/metrics", { json: { stats: { ...serverStats, ...player.stats, scenario: c.scenario.id,
+      heard: player.muted ? "interrompida" : "completa" } } }).catch(() => {});
+  }
+  if (mine() && c.state !== "recording") setCallState(c, "idle");
+}
+
+// ---- pages ----
 async function renderChat(arg, ccArg) {
   if (ccArg && CC_MODES.some(([v]) => v === ccArg)) store.set("cc", ccArg);
+  if (CALL) {
+    if (!arg || String(CALL.scenario.id) === String(arg)) { if (location.hash !== "#call") history.replaceState(null, "", "#call"); return mountCall(); }
+    return renderCallBusy(arg);
+  }
   if (!pendingScenario && arg) { await startScenario(arg); return; }
   if (!pendingScenario) { location.hash = "home"; return; }
   const scenario = pendingScenario;
   pendingScenario = null;
-  let cc = settings.cc;
+  history.replaceState(null, "", "#call");
+  mountCall.pending = startCall(scenario).catch((e) => toast("Chamada: " + e.message));
+  mountCall();
+}
 
+// Trying to open another call while one is going on: go back to it or end it, never two at once.
+function renderCallBusy(target) {
+  const c = CALL;
+  view.innerHTML = pageHead("Você já está numa chamada", `Encerre a chamada com ${esc(c.scenario.persona)} para começar outra.`) + `
+    <div class="panel busy-call">
+      <div class="lower-third">${avatar(c.scenario.voice, c.scenario.persona, "lg")}
+        <span><span class="name">${esc(c.scenario.persona)}</span><br>
+        <span class="role">${esc(c.scenario.title_pt || c.scenario.title || "")} · <span class="num" data-call-time>${callElapsed(c)}</span></span></span></div>
+      <div class="row" style="margin-top:16px">
+        <a class="btn btn-primary" href="#call">${ic("phone")} Voltar para a chamada</a>
+        <button class="btn btn-danger" data-call-end>${ic("x")} Encerrar e ver feedback</button>
+      </div>
+      <p class="faint" style="margin-top:12px;font-size:var(--fs-sm)">Depois de encerrar, abra de novo a conversa que você queria${target ? "" : ""}.</p>
+    </div>`;
+}
+
+function mountCall() {
+  const c = CALL;
+  const scenario = c.scenario;
+  const cc = () => settings.cc;
   view.innerHTML = `
   <section class="talk" aria-label="Conversa">
     <div class="talk-head">
       <div><span class="title">${esc(scenario.title_pt || scenario.title)}</span></div>
       <div class="row">
+        <span id="stream-slot"></span>
         <label class="muted" style="display:inline-flex;align-items:center;gap:8px">Voz
           <input id="speed" type="range" min="0.7" max="1.2" step="0.05" aria-label="Velocidade da voz" style="width:96px"></label>
       </div>
@@ -764,17 +1128,17 @@ async function renderChat(arg, ccArg) {
 
     <div class="hood scene call">
       <div class="bar">
-        <span class="pill call-time"><span class="live-dot" aria-hidden="true"></span><span id="call-time" class="num">00:00</span></span>
-        <div class="seg" role="group" aria-label="Legendas">${CC_MODES.map(([v, l]) => `<button type="button" data-cc="${v}" aria-pressed="${v === cc}">${v === "off" ? ic("cc") : ""}${l}</button>`).join("")}</div>
+        <span class="pill call-time"><span class="live-dot" aria-hidden="true"></span><span class="num" data-call-time>${callElapsed(c)}</span></span>
+        <div class="seg" role="group" aria-label="Legendas">${CC_MODES.map(([v, l]) => `<button type="button" data-cc="${v}" aria-pressed="${v === cc()}">${v === "off" ? ic("cc") : ""}${l}</button>`).join("")}</div>
       </div>
-      <div class="speaker" id="speaker" style="--lvl:0">
+      <div class="speaker" id="speaker" data-call-level style="--lvl:0">
         <span class="ring" aria-hidden="true"></span>${avatar(scenario.voice, scenario.persona, "face")}
       </div>
       <div class="line" aria-live="polite">
         <div id="sub-slot"></div>
         <div id="you"></div>
       </div>
-      <div class="nameplate" id="nameplate" style="--lvl:0">
+      <div class="nameplate" id="nameplate" data-call-level style="--lvl:0">
         <span class="bars" aria-hidden="true"><i></i><i></i><i></i></span>
         <span><strong>${esc(scenario.persona)}</strong> <span class="role">· ${esc(scenario.briefing?.persona?.role || scenario.role || "")}</span></span>
       </div>
@@ -798,6 +1162,7 @@ async function renderChat(arg, ccArg) {
         <button class="btn" id="btn-end">${ic("check")} Encerrar e ver feedback</button></div>
     </div>
     <p class="tip" id="real-tip">Sem legenda, como numa call real. Não entendeu? Peça: <em>"Sorry, could you say that again?"</em></p>
+    <p class="tip faint">A chamada continua se você abrir outra página: ela fica na barra do canto da tela até você encerrar.</p>
 
     <div id="help-box" class="panel help-panel hidden" aria-live="polite"></div>
 
@@ -810,44 +1175,36 @@ async function renderChat(arg, ccArg) {
   const speed = $("#speed");
   speed.value = settings.speed;
   speed.oninput = () => store.set("speed", Number(speed.value));
-
-  const rec = new Recorder();
-  let session = null, busy = true, lastAssistant = "", lastSay = "", helpRec = null;
-  const listening = { reveals: 0, replays: 0 };
-  const turns = [];
+  let helpRec = null;
 
   // ---- meeting-style speaking indicators driven by real audio levels ----
   const speakerEl = $("#speaker"), plate = $("#nameplate"), selfTile = $("#self-tile");
-  speakLevel = (l) => { speakerEl.style.setProperty("--lvl", l.toFixed(3)); plate.style.setProperty("--lvl", l.toFixed(3)); };
-  rec.onLevel = (l) => selfTile.style.setProperty("--lvl", l.toFixed(3));
-  const setPartnerSpeaking = (on) => { speakerEl.classList.toggle("speaking", on); plate.classList.toggle("speaking", on); };
+  c.rec.onLevel = (l) => selfTile.style.setProperty("--lvl", l.toFixed(3));
   const setSelfLive = (on) => {
     selfTile.classList.toggle("live", on);
     $("#self-mic").innerHTML = ic(on ? "mic" : "micOff");
   };
-  const t0 = Date.now();
-  const clock = setInterval(() => { const s = Math.floor((Date.now() - t0) / 1000); $("#call-time").textContent = fmtSec(s).padStart(5, "0"); }, 1000);
 
   // ---- captions ----
-  function renderSubtitle(speaking = false) {
-    $("#btn-replay").classList.toggle("hidden", cc === "off");
-    $("#real-tip").classList.toggle("hidden", cc !== "off");
-    if (!lastAssistant) { subSlot.innerHTML = `<span class="placeholder">${ic("volume")} ${esc(scenario.persona)} está entrando na call…</span>`; return; }
-    if (cc === "off") {
-      subSlot.innerHTML = `<span class="placeholder">${ic("volume")}
-        ${esc(scenario.persona)} ${speaking ? "está falando" : "falou"}</span>`;
-    } else {
-      subSlot.innerHTML = `<p class="subtitle ${cc === "reveal" ? "blurred" : ""}" id="sub" title="${cc === "reveal" ? "Clique para revelar a legenda" : ""}">${esc(lastAssistant)}</p>
-        ${cc === "reveal" ? `<span class="hint">Clique na legenda para revelar</span>` : ""}`;
-      const s = $("#sub");
-      if (cc === "reveal") s.onclick = () => { if (s.classList.contains("blurred")) { listening.reveals++; s.classList.remove("blurred"); s.nextElementSibling?.remove(); } };
+  function renderSubtitle() {
+    const mode = cc();
+    const speaking = ["speaking", "preparing"].includes(c.state);
+    $("#btn-replay").classList.toggle("hidden", mode === "off" || !c.lastAssistant);
+    $("#real-tip").classList.toggle("hidden", mode !== "off");
+    if (!c.lastAssistant) { subSlot.innerHTML = `<span class="placeholder">${ic("volume")} ${esc(scenario.persona)} está entrando na call…</span>`; return; }
+    if (mode === "off") {
+      subSlot.innerHTML = `<span class="placeholder">${ic("volume")} ${esc(scenario.persona)} ${speaking ? "está falando" : "falou"}</span>`;
+      return;
     }
-    $("#btn-replay").classList.toggle("hidden", cc === "off");
-    $("#real-tip").classList.toggle("hidden", cc !== "off");
+    const blurred = mode === "reveal" && !c.revealed;
+    subSlot.innerHTML = `<p class="subtitle ${blurred ? "blurred" : ""}" id="sub" title="${blurred ? "Clique para revelar a legenda" : ""}">${esc(c.lastAssistant)}</p>
+      ${blurred ? `<span class="hint">Clique na legenda para revelar</span>` : ""}`;
+    const s = $("#sub");
+    if (blurred) s.onclick = () => { c.listening.reveals++; c.revealed = true; renderSubtitle(); };
   }
   function renderLines() {
-    lines.innerHTML = turns.map((t) => t.role === "assistant"
-      ? `<div class="t-line persona"><span class="who">${esc(scenario.persona)}</span><span class="txt ${cc === "on" ? "" : "blurred"}" data-reveal>${esc(t.text)}
+    lines.innerHTML = c.turns.map((t) => t.role === "assistant"
+      ? `<div class="t-line persona"><span class="who">${esc(scenario.persona)}</span><span class="txt ${cc() === "on" ? "" : "blurred"}" data-reveal>${esc(t.text)}
           <button class="icon-btn star" data-phrase-from="${esc(t.text)}" title="Salvar um trecho" aria-label="Salvar um trecho">${ic("star")}</button></span></div>`
       : `<div class="t-line"><span class="who">Você</span><span class="txt">${esc(t.text)}</span></div>`).join("")
       || `<p class="faint">A conversa aparece aqui.</p>`;
@@ -861,13 +1218,14 @@ async function renderChat(arg, ccArg) {
     }));
   }
   $$("[data-cc]").forEach((b) => (b.onclick = () => {
-    cc = b.dataset.cc;
-    store.set("cc", cc);
+    store.set("cc", b.dataset.cc);
     $$("[data-cc]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
     renderSubtitle(); renderLines();
   }));
 
-  function showYou(u) {
+  function showYou() {
+    const u = c.you;
+    if (!u) { you.innerHTML = ""; return; }
     const words = u.words?.length
       ? u.words.map((w) => (w.p < 0.45 && !/^(um|uh|uhm|er|ah|hmm)[.,]?$/i.test(w.w)
           ? `<span class="unclear" title="pouco claro para o reconhecedor (${Math.round(w.p * 100)}%)">${esc(w.w)}</span>` : esc(w.w))).join(" ")
@@ -881,61 +1239,38 @@ async function renderChat(arg, ccArg) {
         ${m.unclear.length ? `<span class="pill warn">${plural(m.unclear.length, "palavra pouco clara", "palavras pouco claras")}</span>` : ""}</div>` : ""}</div>`;
   }
 
-  const setBusy = (b, text) => {
-    busy = b;
-    mic.disabled = b;
-    hint.innerHTML = text || (b ? "…" : `Clique no microfone ou segure <kbd>Espaço</kbd> para falar`);
-  };
-
-  // `say` is the same line with sound tags (<laugh>...) for the expressive voice; `text` is what is shown.
-  async function personaSays(text, say) {
-    lastAssistant = text;
-    lastSay = say || text;
-    turns.push({ role: "assistant", text });
-    renderLines();
-    renderSubtitle(true);
-    busy = false; mic.disabled = false;
-    const talking = () => { hint.textContent = `${scenario.persona} está falando… você já pode responder`; setPartnerSpeaking(true); };
-    if (VOICE_ENGINE === "orpheus") hint.textContent = `${scenario.persona} vai falar…`;
-    else talking();
-    try { await speak(lastSay, session.voice, { onStart: talking }); } catch (e) { toast("Voz: " + e.message); }
-    setPartnerSpeaking(false);
-    renderSubtitle(false);
-    if (!rec.active) setBusy(false);
+  function sync() {
+    const speaking = c.state === "speaking";
+    speakerEl.classList.toggle("speaking", speaking);
+    plate.classList.toggle("speaking", speaking);
+    mic.disabled = !(canTalk(c) || c.state === "recording");
+    hint.innerHTML = callHint(c);
+    $("#btn-end").disabled = c.ending;
+    $("#stream-slot").innerHTML = c.session ? streamPill(!!c.session.streaming) : "";
+    renderSubtitle();
   }
 
   async function startRec() {
-    if (busy || rec.active) return;
-    try { await rec.start(); } catch (e) { hint.textContent = "Sem acesso ao microfone: " + e.message; return; }
-    setPartnerSpeaking(false);
+    if (!canTalk(c) || c.rec.active) return;
+    try { await c.rec.start(); } catch (e) { setCallState(c, "idle", "Sem acesso ao microfone: " + e.message); return; }
     setSelfLive(true);
     mic.classList.add("rec");
     mic.setAttribute("aria-label", "Parar e enviar");
     mic.innerHTML = ic("square");
-    hint.innerHTML = "Gravando… clique de novo ou solte <kbd>Espaço</kbd> para enviar";
+    setCallState(c, "recording");
   }
   async function stopRec() {
-    if (!rec.active) return;
+    if (!c.rec.active) return;
     setSelfLive(false);
     mic.classList.remove("rec");
     mic.setAttribute("aria-label", "Falar");
     mic.innerHTML = ic("mic");
-    const blob = await rec.stop();
-    if (Date.now() - rec.startedAt < 600) { setBusy(false, "Muito curto. Tente de novo."); return; }
-    setBusy(true, "Transcrevendo…");
-    const fd = new FormData();
-    fd.append("audio", blob, blobName(blob));
-    try {
-      const r = await api(`/api/session/${session.session_id}/turn`, { method: "POST", body: fd });
-      if (r.empty) { setBusy(false, "Não ouvi nada. Fale mais perto do microfone e tente de novo."); return; }
-      turns.push({ role: "user", text: r.user.text });
-      showYou(r.user);
-      hint.textContent = `${scenario.persona} está pensando…`;
-      await personaSays(r.reply, r.say);
-    } catch (e) { setBusy(false, "Erro: " + esc(e.message)); }
+    const blob = await c.rec.stop();
+    if (Date.now() - c.rec.startedAt < 600) { setCallState(c, "idle", "Muito curto. Tente de novo."); return; }
+    await callTurn(c, { blob });
   }
 
-  mic.onclick = () => (rec.active ? stopRec() : startRec());
+  mic.onclick = () => (c.rec.active ? stopRec() : startRec());
   const onKey = (e) => {
     if (e.code !== "Space" || e.target.closest("input,select,textarea")) return;
     if (e.target.closest("button") && e.target.closest("button") !== mic) return;
@@ -945,20 +1280,13 @@ async function renderChat(arg, ccArg) {
   };
   document.addEventListener("keydown", onKey);
   document.addEventListener("keyup", onKey);
-  cleanup = () => {
-    speakLevel = null;
-    clearInterval(clock);
-    document.removeEventListener("keydown", onKey);
-    document.removeEventListener("keyup", onKey);
-    rec.stop();
-    helpRec?.stop();
-  };
 
   $("#btn-replay").onclick = () => {
-    if (!lastAssistant) return;
-    if (cc === "reveal") listening.replays++;
-    speak(lastSay || lastAssistant, session.voice).catch((e) => toast(e.message));
+    if (!c.lastAssistant) return;
+    if (cc() === "reveal") c.listening.replays++;
+    speak(c.lastSay || c.lastAssistant, c.session?.voice || scenario.voice).catch((e) => toast(e.message));
   };
+  $("#btn-end").onclick = () => endCall();
 
   const drawer = $("#drawer");
   if (drawer) {
@@ -982,7 +1310,7 @@ async function renderChat(arg, ccArg) {
     box.textContent = "Pensando…";
     try {
       const heard = await transcribe(await helpRec.stop(), "pt");
-      const r = await api("/api/help", { json: { text: heard.text, context: lastAssistant } });
+      const r = await api("/api/help", { json: { text: heard.text, context: c.lastAssistant } });
       box.textContent = `Você: "${heard.text}"\n\n${r.answer}`;
       const opts = [...r.answer.matchAll(/Option \d[^:]*:\s*(.+)/g)].map((m) => m[1].trim());
       const row = document.createElement("div");
@@ -999,23 +1327,20 @@ async function renderChat(arg, ccArg) {
     } catch (e) { box.textContent = "Erro: " + e.message; }
   };
 
-  $("#btn-end").onclick = async () => {
-    if (!session || !confirm("Encerrar a conversa e gerar o feedback?")) return;
-    cleanup(); cleanup = null; stopAudio();
-    setBusy(true, "Gerando seu feedback… cerca de 30 segundos");
-    $("#btn-end").disabled = true;
-    try {
-      await api(`/api/session/${session.session_id}/end`, { json: { ...listening, text_mode: { off: "real", reveal: "reveal", on: "visible" }[cc] } });
-      location.hash = "report/" + session.session_id;
-    } catch (e) { setBusy(true, "Erro ao gerar o feedback: " + esc(e.message)); }
+  c.view = { sync, showYou, renderSubtitle, renderLines,
+    fail(msg) { hint.innerHTML = `${esc(msg)} <a href="#home">Voltar ao início</a>`; mic.disabled = true; $("#btn-end").disabled = true; } };
+  // Leaving the call screen keeps the call going (the bar takes over); a recording in progress is discarded.
+  cleanup = () => {
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("keyup", onKey);
+    helpRec?.stop();
+    c.rec.onLevel = null;
+    if (c.rec.active) { c.rec.stop(); if (CALL === c) setCallState(c, "idle"); }
+    c.view = null;
+    paintCallBar();
   };
-
-  renderSubtitle(); renderLines();
-  try {
-    session = await api("/api/session/start", { json: { scenario: scenario.id, level: settings.level } });
-    currentVoice = session.voice;
-    await personaSays(session.reply, session.say);
-  } catch (e) { setBusy(true, "Não conectou: " + esc(e.message)); }
+  showYou(); renderLines(); sync();
+  paintCallBar();
 }
 
 // =====================================================================
@@ -1880,10 +2205,12 @@ async function renderSettings() {
       <section class="set-sec"><header><h2>Conversa</h2><p>Valem para as próximas ligações.</p></header><div class="body">
         <label class="field"><span class="inline">Velocidade da voz <span class="num" id="s-speed-val"></span></span><input id="s-speed" type="range" min="0.7" max="1.2" step="0.05"></label>
         <label class="field">Legendas ao começar <select id="s-cc">${CC_MODES.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></label>
+        <label class="field check"><span class="inline"><input type="checkbox" id="s-fillers"> Preencher esperas longas com um “hmm”</span>
+          <span class="help">Se a resposta demora mais de 2 s para começar, o personagem faz um som curto de quem está pensando, como numa call de verdade.</span></label>
         <label class="field">Nível do interlocutor <select id="s-level"><option value="friendly">Amigável: claro, sem muita gíria</option><option value="realistic">Realista: velocidade e expressões nativas</option></select></label>
       </div></section>
       <section class="set-sec"><header><h2>Voz dos personagens</h2><p>Com ou sem emoção. A voz com emoção só aparece liberada se o seu computador aguenta.</p></header>
-        <div class="body" id="s-voice"></div></section>
+        <div class="body"><div id="s-voice"></div><div id="s-voice-metrics"></div></div></section>
       <section class="set-sec"><header><h2>Reconhecimento e modelos</h2><p>Trocar o modelo baixa o novo e recarrega o ouvido.</p></header><div class="body">
         ${presetHTML(o, running)}
         ${advancedHTML(o, running)}
@@ -1905,6 +2232,10 @@ async function renderSettings() {
     showSpeed();
     sp.oninput = () => { store.set("speed", Number(sp.value)); showSpeed(); };
     cc.onchange = () => store.set("cc", cc.value);
+    const fl = $("#s-fillers");
+    fl.checked = settings.fillers;
+    fl.onchange = () => store.set("fillers", fl.checked);
+    voiceMetrics($("#s-voice-metrics"));
     lv.onchange = () => store.set("level", lv.value);
     $("#s-onboard").onclick = async () => { await setFlags({ onboarding_done: false }); location.hash = "onboard/mic"; };
     bindTrack($("#s-track"), () => toast(isDev() ? "Foco: trabalho como desenvolvedor" : "Foco: dia a dia"));
@@ -2027,6 +2358,26 @@ function voicePanel(root) {
   return { stop() { stopped = true; clearTimeout(timer); } };
 }
 
+// How the voice actually behaved in recent calls (measured by the player and the server), to tell a slow model
+// from a slow voice.
+async function voiceMetrics(root) {
+  const m = await api("/api/voice/metrics").catch(() => null);
+  const s = m?.summary;
+  if (!s?.n) { root.innerHTML = `<p class="hint-line">Depois da primeira chamada, aqui aparece quanto a voz demorou para começar e se ela parou no meio.</p>`; return; }
+  const sec = (x) => (x == null ? "–" : x.toFixed(1).replace(".", ",") + " s");
+  const last = m.turns.at(-1) || {};
+  root.innerHTML = `<div class="panel stack voice-metrics"><b>Nas últimas ${plural(s.n, "fala", "falas")} (mediana)</b>
+    <div class="metrics-row">
+      ${metricRow("Até a primeira palavra", sec(s.first_sound_s))}
+      ${metricRow("Transcrever você", sec(s.stt_s))}
+      ${metricRow("IA começar a responder", sec(s.llm_first_s))}
+      ${metricRow("Maior pausa no meio da fala", sec(s.gap_max_s))}
+      ${s.rtf != null ? metricRow("Tempo de geração por segundo de fala", s.rtf.toFixed(2).replace(".", ",") + "×") : ""}
+    </div>
+    <p class="hint-line">Última fala: voz ${esc(last.engine || "–")}, ${last.streaming ? "com streaming (Claude)" : "sem streaming"}.
+      ${s.rtf != null && s.rtf > 1 ? "A voz é gerada mais devagar que o tempo real neste computador: pausas entre frases são esperadas. A voz neutra (Kokoro) não tem esse problema." : ""}</p></div>`;
+}
+
 // =====================================================================
 // track (dev | daily)
 // =====================================================================
@@ -2057,7 +2408,11 @@ function bindTrack(root, onChange) {
 const ROLE_INFO = [["chat", "Conversa", "Responde ao vivo."],
   ["feedback", "Feedback e cenários", "Relatório, roteiros e pacotes; vale o modelo mais forte."],
   ["helper", "Ajudas", "“Como se diz?”, re-tell e frases."]];
-const PROVIDER_SPEED = { claude: "Mais rápido na conversa (1 a 3 s por fala).", gemini: "Cada fala leva uns 10 s.", codex: "Cada fala leva alguns segundos." };
+const PROVIDER_SPEED = { claude: "Mais rápido na conversa: a voz começa em 1 a 2 s.", gemini: "Cada fala leva uns 10 s.", codex: "Cada fala leva alguns segundos." };
+// Only Claude streams the reply token by token. What depends on it, so the choice is clear in the UI:
+const STREAMING_FEATURES = "Com streaming, na chamada a voz começa enquanto a resposta ainda está sendo escrita e a legenda aparece aos poucos.";
+const streamingNote = (on) => on ? `Streaming: ${STREAMING_FEATURES.replace("Com streaming, n", "N")}`
+  : "Sem streaming: a voz só começa quando a resposta inteira chega.";
 
 function providerStatus(p) {
   const t = p.task;
@@ -2086,8 +2441,9 @@ function providerRowHTML(p) {
   }
   const retest = p.test?.ok && !busy ? ` · <button class="link-btn" data-ai="test" data-pid="${p.id}">testar de novo</button>` : "";
   return `<div class="job prov ${s.st}" data-row="${p.id}"><span class="mk" aria-hidden="true"></span>
-    <div><div class="t">${esc(p.label)} <span class="muted" style="font-weight:500">· ${esc(p.cli)}${p.version ? " " + esc(p.version) : ""}</span></div>
-      <div class="d">${esc(p.plan)}</div>
+    <div><div class="t">${esc(p.label)} <span class="muted" style="font-weight:500">· ${esc(p.cli)}${p.version ? " " + esc(p.version) : ""}</span>
+        ${p.streaming ? streamPill(true) : ""}</div>
+      <div class="d">${esc(p.plan)}${p.streaming ? " · " + esc(STREAMING_FEATURES) : ""}</div>
       <div class="d prov-state">${esc(s.text)}${retest}</div>
       ${s.log ? `<div class="d prov-log num">${esc(s.log)}</div>` : ""}
       ${busy ? strip(16, "sm busy", "") : ""}
@@ -2105,7 +2461,8 @@ function rolesHTML(ai) {
     return `<div class="field role-field"><span>${label}</span>
       <div class="role-pick"><select data-role-provider="${role}" aria-label="Provedor para ${label}">${Object.entries(ai.catalog).map(([pid, c]) =>
         `<option value="${pid}" ${pid === r.provider ? "selected" : ""}>${esc(c.label)}</option>`).join("")}</select>${model}</div>
-      <span class="help">${help}${role === "chat" && PROVIDER_SPEED[r.provider] ? " " + esc(PROVIDER_SPEED[r.provider]) : ""}</span></div>`;
+      <span class="help">${help}${role === "chat" && PROVIDER_SPEED[r.provider] ? " " + esc(PROVIDER_SPEED[r.provider]) : ""}</span>
+      ${role === "chat" ? `<span class="help stream-help">${streamPill(!!cat.streaming)} ${esc(streamingNote(!!cat.streaming))}</span>` : ""}</div>`;
   }).join("");
 }
 

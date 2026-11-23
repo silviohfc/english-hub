@@ -1,18 +1,21 @@
 """FastAPI server: serves the UI and the local practice API on http://127.0.0.1:8765"""
 from __future__ import annotations
 
+import collections
 import json
 import logging
+import queue
 import struct
 import threading
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, llm, metrics, prompts, providers, uninstall, voices
+from . import config, db, llm, metrics, prompts, providers, speech, uninstall, voices
 from . import setup as setup_mod
 from .stt import stt
 from .tts import tts
@@ -32,7 +35,8 @@ async def _no_stale_ui(request, call_next):
     return response
 STATIC = config.ROOT / "app" / "static"
 
-# Live conversations: session_id -> {"chat": ChatProcess, "scenario": str}
+# The live call (at most one): session_id -> {"chat": ChatProcess, "scenario", "voice", "persona", "started_at"}.
+# A call lasts until it is ended explicitly; the UI follows it across pages and restores it after a reload.
 LIVE: dict[int, dict] = {}
 
 
@@ -127,6 +131,7 @@ def status():
             "setup_done": flags["setup_done"], "onboarding_done": flags["onboarding_done"],
             "installing": setup_mod.job.running,
             "voice_engine": voices.active(),
+            "chat_streaming": bool(providers.PROVIDERS[config.CHAT_PROVIDER].get("streaming")),
             "voice_rtf": (voices.worker.rtf or voices._mark().get("rtf")) if voices.active() == "orpheus" else None}
 
 
@@ -168,7 +173,8 @@ def _ai_overview() -> dict:
     with ThreadPoolExecutor(max_workers=len(providers.PROVIDERS)) as pool:  # each state runs the CLI's own commands
         states = list(pool.map(providers.state, providers.PROVIDERS))
     return {"providers": states, "roles": roles,
-            "catalog": {pid: {"label": p["label"], "models": p["models"], "defaults": p["defaults"]}
+            "catalog": {pid: {"label": p["label"], "models": p["models"], "defaults": p["defaults"],
+                              "streaming": bool(p.get("streaming"))}
                         for pid, p in providers.PROVIDERS.items()},
             "os": providers.system_label()}
 
@@ -253,26 +259,44 @@ class StartReq(BaseModel):
     level: str = "friendly"
 
 
+def _call_info(sid: int) -> dict:
+    live = LIVE[sid]
+    return {"session_id": sid, "scenario": live["scenario"], "persona": live["persona"], "voice": live["voice"],
+            "started_at": live["started_at"], "streaming": live["chat"].streaming}
+
+
 @app.post("/api/session/start")
 async def start_session(req: StartReq):
+    """Opens the call. Only one call at a time: a second start is refused until the first is ended. The opening
+    line comes from /api/session/{sid}/turn/stream with `start`, so it is spoken while it is written."""
+    if LIVE:
+        sid = next(iter(LIVE))
+        return JSONResponse({"detail": f"Já existe uma chamada em andamento com {LIVE[sid]['persona']}. "
+                                       "Encerre-a antes de começar outra.", "active": _call_info(sid)}, status_code=409)
     scn = resolve_scenario(req.scenario)
     sid = db.create_session(req.scenario, req.level, scn.get("title_pt") or scn.get("title"))
     system = prompts.chat_system_prompt(scn, req.level, db.watch_items(), db.training_phrases(),
                                         expressive=voices.expressive())
-
-    def run():
-        chat = llm.ChatProcess(system)
-        return chat, chat.send("[START]")
-
     try:
-        chat, opening = await run_in_threadpool(run)
+        chat = await run_in_threadpool(llm.ChatProcess, system)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Claude CLI error: {e}") from e
-    LIVE[sid] = {"chat": chat, "scenario": req.scenario}
-    # `say` keeps the sound tags (<laugh>...) for the expressive voice; captions and history get clean text.
-    db.add_turn(sid, "assistant", voices.clean(opening))
-    return {"session_id": sid, "persona": scn["persona"], "voice": scn["voice"], "reply": voices.clean(opening),
-            "say": opening}
+    LIVE[sid] = {"chat": chat, "scenario": req.scenario, "persona": scn["persona"], "voice": scn["voice"],
+                 "started_at": time.time(), "order": threading.Lock(), "turns": 0}
+    return {**_call_info(sid), "persona": scn["persona"], "voice": scn["voice"]}
+
+
+@app.get("/api/call")
+def active_call():
+    """The call in progress (with its turns, to rebuild the call screen after a reload), or {"active": None}."""
+    if not LIVE:
+        return {"active": None}
+    sid = next(iter(LIVE))
+    s = db.get_session(sid) or {}
+    info = _call_info(sid)
+    info["scenario_info"] = scenario_info(info["scenario"])
+    info["turns"] = [{"role": t["role"], "text": t["text"]} for t in s.get("turns", [])]
+    return {"active": info}
 
 
 def _live(sid: int) -> dict:
@@ -282,24 +306,167 @@ def _live(sid: int) -> dict:
     return live
 
 
-@app.post("/api/session/{sid}/turn")
-async def turn(sid: int, audio: UploadFile | None = File(None), text: str | None = Form(None)):
-    live = _live(sid)
-    if audio is not None:
-        heard = await run_in_threadpool(stt.transcribe, await audio.read(), "en")
-    else:
-        heard = {"text": (text or "").strip(), "words": [], "duration": 0}
-    if not heard["text"]:
-        return {"empty": True}
-    m = metrics.turn_metrics(heard["words"]) if heard["words"] else None
-    db.add_turn(sid, "user", heard["text"], heard["words"], m)
+def _frame(kind: bytes, data: bytes = b"") -> bytes:
+    return kind + struct.pack("<I", len(data)) + data
+
+
+def _jframe(obj: dict) -> bytes:
+    return _frame(b"J", json.dumps(obj, ensure_ascii=False).encode())
+
+
+# Voice timings of recent turns (server side plus what the player measured), for the settings page and the log.
+VOICE_LOG: collections.deque = collections.deque(maxlen=50)
+
+
+def _partial_clean(text: str) -> str:
+    """Caption text while the reply is still arriving: without sound tags, even a tag cut in half."""
+    return voices.clean(text[:text.rfind("<")] if text.rfind("<") > text.rfind(">") else text)
+
+
+def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, text: str, start: bool,
+              speed: float, ctx: dict) -> None:
+    """One turn, pipelined: STT -> chat reply token by token -> pieces -> voice, all overlapping.
+    Puts frames on `out` (None at the end). If the learner hangs up (`stop`), the voice stops at once, but the
+    reply is still read to its end and saved, so the conversation stays consistent."""
+    t0 = time.time()
+    st: dict = {"t": time.strftime("%H:%M:%S"), "streaming": live["chat"].streaming, "start": start}
+    sp = None
+    order, locked = live["order"], False
     try:
-        reply = await run_in_threadpool(live["chat"].send, metrics.marked_text(heard["words"], heard["text"]))
+        if start:
+            msg = "[START]"
+        else:
+            if audio is not None:
+                heard = stt.transcribe(audio, "en")
+            else:
+                heard = {"text": text.strip(), "words": [], "duration": 0}
+            st["stt_s"] = round(time.time() - t0, 3)
+            if not heard["text"]:
+                out.put(_jframe({"type": "empty"}))
+                return
+            m = metrics.turn_metrics(heard["words"]) if heard["words"] else None
+        # Turns are saved in order: a learner who talks over the partner waits here until the reply being written
+        # is complete (the voice of that reply was already silenced).
+        order.acquire()
+        locked = True
+        if not start:
+            db.add_turn(sid, "user", heard["text"], heard["words"], m)
+            out.put(_jframe({"type": "user", "user": {"text": heard["text"], "words": heard["words"], "metrics": m}}))
+            msg = metrics.marked_text(heard["words"], heard["text"])
+
+        engine = speech.engine_for()
+        st["engine"] = engine
+        sp = speech.Speech(engine, prompts.voice(live["voice"]), speed if engine == "kokoro" else 1.0)
+        ctx["sp"] = sp
+        if ctx["stop"].is_set():
+            sp.close()
+        out.put(_jframe({"type": "voice", "engine": engine, "sample_rate": speech.SR}))
+
+        def play():
+            try:
+                for kind, data in sp:
+                    out.put(_frame(b"P", data) if kind == "pcm" else _frame(b"E") if kind == "end"
+                            else _jframe({"type": "piece", "text": data}))
+            except Exception as e:  # noqa: BLE001
+                log.warning("voice failed mid-line: %s", e)
+                out.put(_jframe({"type": "voice_error", "message": str(e)}))
+        player = threading.Thread(target=play, daemon=True)
+        player.start()
+
+        seg = speech.Segmenter(speech.POLICY.get(engine, speech.POLICY["kokoro"]))
+        t_llm, said = time.time(), ""
+        try:
+            for delta in live["chat"].stream(msg):
+                if "llm_first_s" not in st:
+                    st["llm_first_s"] = round(time.time() - t_llm, 3)
+                said += delta
+                out.put(_jframe({"type": "text", "text": _partial_clean(said)}))
+                for piece in seg.feed(delta):
+                    sp.add(piece)
+        except Exception as e:  # noqa: BLE001
+            sp.close()
+            out.put(_jframe({"type": "error", "message": f"Claude CLI error: {e}"}))
+            return
+        for piece in seg.flush():
+            sp.add(piece)
+        sp.finish()
+        st["llm_s"] = round(time.time() - t_llm, 3)
+        said = said.strip()
+        db.add_turn(sid, "assistant", voices.clean(said))
+        order.release()
+        locked = False
+        out.put(_jframe({"type": "reply", "reply": voices.clean(said), "say": said}))
+        player.join()
+        st.update(sp.stats)
+        st["rtf"] = voices.worker.rtf if engine == "orpheus" else (
+            round(sp.stats["gen_s"] / sp.stats["audio_s"], 2) if sp.stats["audio_s"] else None)
+        # From the end of the learner's speech (request received) to the first audio sent.
+        fa = sp.stats["first_audio_s"]
+        st["first_audio_s"] = round(fa + (sp._t0 - t0), 3) if fa is not None else None
+        st["cancelled"] = sp.cancelled or ctx["stop"].is_set()
+        out.put(_jframe({"type": "stats", "stats": st}))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"Claude CLI error: {e}") from e
-    db.add_turn(sid, "assistant", voices.clean(reply))
-    return {"user": {"text": heard["text"], "words": heard["words"], "metrics": m}, "reply": voices.clean(reply),
-            "say": reply}
+        log.exception("turn failed")
+        if sp:
+            sp.close()
+        out.put(_jframe({"type": "error", "message": str(e)}))
+    finally:
+        if locked:
+            order.release()
+        out.put(None)
+
+
+@app.post("/api/session/{sid}/turn/stream")
+async def turn_stream(sid: int, request: Request, audio: UploadFile | None = File(None),
+                      text: str | None = Form(None), start: bool = Form(False), speed: float = Form(1.0),
+                      voice: bool = Form(True)):
+    """A turn as one framed binary stream, so the voice starts while the reply is still being written:
+    b"J" + u32 + JSON event ({"type": user|voice|piece|text|reply|stats|empty|error|voice_error}),
+    b"P" + u32 + PCM (s16le, mono, 24 kHz) and b"E" + u32 0 at the end of each spoken piece.
+    With `start`, it is the partner's opening line; with `voice` false, only the text comes. Closing the request,
+    or /hush, stops the voice (the learner interrupted)."""
+    live = _live(sid)
+    data = await audio.read() if audio is not None else None
+    out: queue.Queue = queue.Queue()
+    live["turns"] += 1
+    ctx = {"stop": threading.Event(), "sp": None, "id": live["turns"]}
+    live["turn"] = ctx
+    if not voice:  # the player speaks the reply itself afterwards (Orpheus at a speed far from 1x)
+        ctx["stop"].set()
+    threading.Thread(target=_run_turn, args=(live, sid, out, data, text or "", start,
+                                             max(0.6, min(1.4, speed)), ctx), daemon=True).start()
+
+    async def body():
+        try:
+            while (item := await run_in_threadpool(out.get)) is not None:
+                # uvicorn doesn't fail the send when the browser hangs up: check, so an interrupted line stops
+                # generating right away instead of making the next turn wait behind it.
+                if await request.is_disconnected():
+                    break
+                yield item
+        finally:
+            ctx["stop"].set()
+            if ctx["sp"] is not None:
+                ctx["sp"].close()
+
+            def drain():  # the turn thread keeps reading the reply to its end and saving it
+                while out.get() is not None:
+                    pass
+            threading.Thread(target=drain, daemon=True).start()
+
+    return StreamingResponse(body(), media_type="application/octet-stream",
+                             headers={"Cache-Control": "no-store", "X-Sample-Rate": str(speech.SR),
+                                      "X-Turn": str(ctx["id"])})
+
+
+@app.post("/api/session/{sid}/hush")
+def hush(sid: int, turn: int = 0):
+    """The learner started talking over the partner: stop the voice of that turn (`turn`, from the X-Turn header),
+    but keep its text coming (the reply is still shown and saved)."""
+    ctx = _live(sid).get("turn") or {}
+    if ctx.get("id") == turn and ctx.get("sp") is not None:
+        ctx["sp"].close()
+    return {"ok": True}
 
 
 class EndReq(BaseModel):
@@ -407,53 +574,80 @@ class StreamReq(BaseModel):
     text: str
     voice: str = "af_heart"
     cache: bool = False
-    chunks: list[str] = []  # the line split in sentences by the player (it pauses only between them)
-
-
-def _frame(kind: bytes, data: bytes = b"") -> bytes:
-    return kind + struct.pack("<I", len(data)) + data
+    speed: float = 1.0
+    engine: str = ""  # preview a specific engine; default: the active one
 
 
 @app.post("/api/tts/stream")
 async def speak_stream(req: StreamReq, request: Request):
-    """Orpheus line sent while it is generated, so playback starts early. Framed binary stream:
-    b"P" + u32 length + PCM (s16le, mono, 24 kHz), and b"E" + u32 0 after each sentence.
-    Closing the request (the learner interrupted) cancels what is left. With `cache`, a line already generated is
+    """A line sent while it is generated, on any engine, so playback starts early. Framed binary stream:
+    b"J" + u32 + {"type": "piece", "text"} before each spoken piece, b"P" + u32 length + PCM (s16le, mono,
+    24 kHz), and b"E" + u32 0 after it. Closing the request (the learner interrupted) cancels what is left. With `cache`, a line already generated is
     sent from disk at once, and a new one is saved when it finishes."""
-    headers = {"X-TTS-Engine": "orpheus", "X-Sample-Rate": "24000", "Cache-Control": "no-store"}
+    engine = await run_in_threadpool(speech.engine_for, req.engine or None)
+    voice = prompts.voice(req.voice)
+    speed = max(0.6, min(1.4, req.speed)) if engine == "kokoro" else 1.0
+    headers = {"X-TTS-Engine": engine, "X-Sample-Rate": str(speech.SR), "Cache-Control": "no-store"}
     media = "application/octet-stream"
-    if req.cache and voices.orpheus_ok():
-        pcm = await run_in_threadpool(voices.cached_pcm, req.voice, req.text)
+    if req.cache:
+        pcm = await run_in_threadpool(voices.cached_pcm, engine, voice, req.text, speed)
         if pcm:
             return Response(_frame(b"P", pcm) + _frame(b"E"), media_type=media, headers={**headers, "X-TTS-Cached": "1"})
+    sp = speech.speak(req.text, engine, voice, speed)
+    it = iter(sp)
     try:
-        st = await run_in_threadpool(voices.stream, req.text, req.voice, req.chunks or None)
-        it = iter(st)
         first = await run_in_threadpool(next, it, None)
     except RuntimeError as e:
+        sp.close()
         raise HTTPException(503, str(e)) from e
 
     async def body():
         got, complete = [], False
         try:
             item = first
-            # uvicorn doesn't fail the send when the browser hangs up, so check explicitly: an interrupted
-            # line must stop generating right away, or the next line waits behind it.
             while item and not await request.is_disconnected():
                 kind, data = item
                 if kind == "pcm":
                     got.append(data)
                     yield _frame(b"P", data)
-                else:
+                elif kind == "end":
                     yield _frame(b"E")
+                else:
+                    yield _jframe({"type": "piece", "text": data})
                 item = await run_in_threadpool(next, it, None)
-            complete = item is None and not st.cancelled
+            complete = item is None and not sp.cancelled
         finally:
-            st.close()
+            sp.close()
             if req.cache and complete:
-                await run_in_threadpool(voices.save_pcm, req.voice, req.text, b"".join(got))
+                await run_in_threadpool(voices.save_pcm, engine, voice, req.text, b"".join(got), speed)
 
     return StreamingResponse(body(), media_type=media, headers=headers)
+
+
+class VoiceStatReq(BaseModel):
+    stats: dict
+
+
+@app.post("/api/voice/metrics")
+def voice_metrics_add(req: VoiceStatReq):
+    """The player's measurements of a turn (first sound, gaps between pieces, underruns), with the server's."""
+    rec = {k: v for k, v in req.stats.items() if isinstance(v, (int, float, str, bool)) or v is None}
+    VOICE_LOG.append(rec)
+    log.info("voice turn: %s", " ".join(f"{k}={v}" for k, v in rec.items()))
+    return {"ok": True}
+
+
+@app.get("/api/voice/metrics")
+def voice_metrics():
+    rows = list(VOICE_LOG)
+
+    def med(key):
+        xs = sorted(r[key] for r in rows if isinstance(r.get(key), (int, float)))
+        return round(xs[len(xs) // 2], 2) if xs else None
+    return {"turns": rows[-20:], "summary": {"n": len(rows), "first_sound_s": med("first_sound_s"),
+                                             "llm_first_s": med("llm_first_s"), "stt_s": med("stt_s"),
+                                             "gap_max_s": med("gap_max_s"), "underruns": med("underruns"),
+                                             "rtf": med("rtf")}}
 
 
 # ---------- voice engines (Kokoro neutral, Orpheus expressive) ----------

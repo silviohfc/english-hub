@@ -165,37 +165,50 @@ def expressive() -> bool:
 # worker process
 # ---------------------------------------------------------------------------------------------
 def _chunks(text: str) -> list[str]:
-    """Sentences grouped to at least ~40 characters: Orpheus sounds best on short inputs, and the next chunk
-    is already queued while the current one plays."""
-    parts = [p.strip() for p in re.findall(r"[^.!?…]+(?:[.!?…]+[\"')\]]*|$)", text) if p.strip()]
-    out: list[str] = []
-    for p in parts:  # same rule as sentenceChunks() in app.js
-        if out and len(out[-1]) < (15 if len(out) == 1 else 40):
-            out[-1] += " " + p
-        else:
-            out.append(p)
-    return out or [text]
+    from . import speech
+    return speech.split(text, "orpheus")
 
 
-class Stream:
-    """One line being spoken: queued in the worker as sentence chunks, read back as it is generated.
-    Yields ("pcm", bytes) and ("end", index) after each sentence, so the player can pause between sentences."""
+class Live:
+    """One line being spoken by Orpheus: pieces are queued in the worker as they arrive (the next one is generated
+    while the current one plays) and read back in order as they are generated.
+    Yields ("pcm", bytes) and ("end", index) after each piece."""
 
-    def __init__(self, w: "Worker", chunks: list[str], voice: str) -> None:
-        self.w, self.ids, self.cancelled = w, [], False
-        for chunk in chunks:
-            self.ids.append(w._send({"text": chunk, "voice": voice}))
+    def __init__(self, w: "Worker", voice: str) -> None:
+        self.w, self.voice = w, voice
+        self.ids: list[int] = []
+        self.finished = self.closed = False
+        self.cond = threading.Condition()
+
+    def add(self, text: str) -> None:
+        with self.cond:
+            if self.closed or self.finished or not text.strip():
+                return
+            self.ids.append(self.w._send({"text": text, "voice": self.voice}))
+            self.cond.notify_all()
+
+    def finish(self) -> None:
+        with self.cond:
+            self.finished = True
+            self.cond.notify_all()
+
+    def _rid(self, i: int) -> int | None:
+        with self.cond:
+            while i >= len(self.ids) and not (self.finished or self.closed):
+                self.cond.wait(0.25)
+            return None if self.closed or i >= len(self.ids) else self.ids[i]
 
     def __iter__(self):
+        i = 0
         try:
-            for i, rid in enumerate(self.ids):
+            while (rid := self._rid(i)) is not None:
                 q = self.w.queues.get(rid)
                 if q is None:  # closed
                     return
                 while True:
                     try:
                         msg = q.get(timeout=60)
-                    except Exception:  # noqa: BLE001
+                    except queue.Empty:
                         self.w._hung()
                         raise RuntimeError("o Orpheus parou de responder") from None
                     if msg.get("closed"):
@@ -209,18 +222,25 @@ class Stream:
                         break
                     else:
                         raise RuntimeError(msg.get("error") or "falha ao gerar a voz")
+                i += 1
         finally:
             self.close()
 
-    def close(self) -> None:
-        """Stop generating what is left (safe to call from any thread, more than once). `cancelled` tells whether
-        something was still pending, i.e. the line was cut short."""
-        for rid in self.ids:
+    def close(self) -> bool:
+        """Stop generating what is left (safe to call from any thread, more than once). Returns whether something
+        was still pending, i.e. the line was cut short."""
+        with self.cond:
+            self.closed = True
+            ids = list(self.ids)
+            self.cond.notify_all()
+        pending = False
+        for rid in ids:
             q = self.w.queues.pop(rid, None)
             if q is not None:
                 q.put({"closed": True})  # wakes a reader blocked on this request
                 self.w._send({"cancel": rid}, raw=True)
-                self.cancelled = True
+                pending = True
+        return pending
 
 
 class Worker:
@@ -321,11 +341,18 @@ class Worker:
             except Exception:  # noqa: BLE001
                 p.kill()
 
-    def stream(self, text: str, voice: str, chunks: list[str] | None = None) -> Stream:
+    def live(self, voice: str) -> Live:
         self.start()
         if self.state != "ready":
             raise RuntimeError(self.error or "Orpheus indisponível")
-        return Stream(self, chunks or _chunks(text), voice)
+        return Live(self, voice)
+
+    def stream(self, text: str, voice: str, chunks: list[str] | None = None) -> Live:
+        st = self.live(voice)
+        for c in chunks or _chunks(text):
+            st.add(c)
+        st.finish()
+        return st
 
     def synth(self, text: str, voice: str) -> bytes:
         """The whole line as a WAV (used by the install test and when the speed is not 1×)."""
@@ -337,16 +364,6 @@ worker = Worker()
 
 def orpheus_ok() -> bool:
     return installed("orpheus") and support("orpheus")["ok"]
-
-
-def stream(text: str, voice: str, chunks: list[str] | None = None) -> Stream:
-    """A character's line with Orpheus, generated sentence by sentence (`chunks`, as split by the player, or split
-    here). Raises before anything is generated if the engine can't speak, so the caller can fall back to a WAV."""
-    if not orpheus_ok():
-        raise RuntimeError("Orpheus não está disponível neste computador.")
-    voice = prompts.voice(voice)
-    parts = [_orpheus_text(c) for c in chunks if c.strip()] if chunks else None
-    return worker.stream(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"), parts)
 
 
 def cache_file(engine: str, voice: str, text: str, speed: float = 1.0) -> Path:
@@ -375,17 +392,22 @@ def pcm_to_wav(pcm: bytes) -> bytes:
     return buf.getvalue()
 
 
-def cached_pcm(voice: str, text: str) -> bytes | None:
-    """Orpheus audio of a cached line as raw PCM (for the streaming endpoint), or None."""
-    f = cache_file("orpheus", voice, text)
+def cached_pcm(engine: str, voice: str, text: str, speed: float = 1.0) -> bytes | None:
+    """Audio of a cached line as raw 24 kHz PCM (for the streaming endpoint), or None."""
+    f = cache_file(engine, voice, text, speed)
     if not f.exists():
         return None
-    with wave.open(str(f), "rb") as w:
-        return w.readframes(w.getnframes())
+    try:
+        with wave.open(str(f), "rb") as w:
+            if w.getframerate() != ORPHEUS_SR or w.getsampwidth() != 2 or w.getnchannels() != 1:
+                return None
+            return w.readframes(w.getnframes())
+    except (OSError, wave.Error, EOFError):
+        return None
 
 
-def save_pcm(voice: str, text: str, pcm: bytes) -> None:
-    _save(cache_file("orpheus", voice, text), pcm_to_wav(pcm))
+def save_pcm(engine: str, voice: str, text: str, pcm: bytes, speed: float = 1.0) -> None:
+    _save(cache_file(engine, voice, text, speed), pcm_to_wav(pcm))
 
 
 def synth(text: str, voice: str, speed: float = 1.0, engine: str | None = None,
