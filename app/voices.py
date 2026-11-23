@@ -10,16 +10,19 @@ The chat model may put sound tags (<laugh>, <sigh>, ...) in the partner's lines 
 removes them for captions, history and the neutral engine."""
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 from . import config, prompts
@@ -31,6 +34,7 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0
 ORPHEUS_DIR = config.ENGINES_DIR / "orpheus"
 ORPHEUS_HF = ORPHEUS_DIR / "hf"
 ORPHEUS_MARK = ORPHEUS_DIR / "installed.json"
+ORPHEUS_SR = 24_000
 ORPHEUS_PY = ORPHEUS_DIR / ".venv" / ("Scripts/python.exe" if WIN else "bin/python")
 ORPHEUS_FILES = [  # (repo, file)
     ("isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF", "orpheus-3b-0.1-ft-q4_k_m.gguf"),
@@ -156,13 +160,73 @@ def expressive() -> bool:
 # ---------------------------------------------------------------------------------------------
 # worker process
 # ---------------------------------------------------------------------------------------------
+def _chunks(text: str) -> list[str]:
+    """Sentences grouped to at least ~40 characters: Orpheus sounds best on short inputs, and the next chunk
+    is already queued while the current one plays."""
+    parts = [p.strip() for p in re.findall(r"[^.!?…]+(?:[.!?…]+[\"')\]]*|$)", text) if p.strip()]
+    out: list[str] = []
+    for p in parts:
+        if out and len(out[-1]) < 40:
+            out[-1] += " " + p
+        else:
+            out.append(p)
+    return out or [text]
+
+
+class Stream:
+    """One line being spoken: queued in the worker as sentence chunks, read back as PCM as it is generated."""
+
+    def __init__(self, w: "Worker", text: str, voice: str) -> None:
+        self.w, self.ids, self.cancelled = w, [], False
+        for chunk in _chunks(text):
+            self.ids.append(w._send({"text": chunk, "voice": voice}))
+
+    def __iter__(self):
+        try:
+            for rid in self.ids:
+                q = self.w.queues.get(rid)
+                if q is None:  # closed
+                    return
+                while True:
+                    try:
+                        msg = q.get(timeout=60)
+                    except Exception:  # noqa: BLE001
+                        self.w._hung()
+                        raise RuntimeError("o Orpheus parou de responder") from None
+                    if msg.get("closed"):
+                        return
+                    if "pcm" in msg:
+                        yield base64.b64decode(msg["pcm"])
+                    elif msg.get("done"):
+                        self.w._stats(msg)
+                        self.w.queues.pop(rid, None)
+                        break
+                    else:
+                        raise RuntimeError(msg.get("error") or "falha ao gerar a voz")
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Stop generating what is left (safe to call from any thread, more than once)."""
+        for rid in self.ids:
+            q = self.w.queues.pop(rid, None)
+            if q is not None:
+                q.put({"closed": True})  # wakes a reader blocked on this request
+                self.w._send({"cancel": rid}, raw=True)
+        self.cancelled = True
+
+
 class Worker:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
-        self.lock = threading.Lock()       # one request at a time
         self.start_lock = threading.Lock()
+        self.write_lock = threading.Lock()
         self.state = "stopped"             # stopped | loading | ready | error
         self.error = ""
+        self.gpu: bool | None = None       # whether llama.cpp is really using the GPU
+        self.rtf: float | None = None      # generation time / speech time, measured on real lines
+        self.tps: float | None = None
+        self.queues: dict[int, "queue.Queue"] = {}
         self._n = 0
 
     def start(self) -> None:
@@ -178,21 +242,64 @@ class Worker:
             args = [str(ORPHEUS_PY), str(Path(__file__).with_name("orpheus_worker.py")),
                     "--model", str(files[0]), "--snac", str(files[1]),
                     "--gpu-layers", "0" if dev == "cpu" else "-1"]
-            self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                         text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW)
-            line = self.proc.stdout.readline()
+            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW)
+            line = proc.stdout.readline()
             try:
                 msg = json.loads(line) if line else {"ready": False, "error": "o processo do Orpheus fechou ao carregar"}
             except ValueError:
                 msg = {"ready": False, "error": line.strip()[:200]}
-            if msg.get("ready"):
-                self.state = "ready"
-                log.info("Orpheus ready (%s).", dev)
-            else:
+            if not msg.get("ready"):
+                self.proc = proc
+                self.stop()
                 self.state, self.error = "error", msg.get("error") or "falha ao carregar"
                 log.warning("Orpheus failed to load: %s", self.error)
-                self.stop()
-                self.state = "error"
+                return
+            self.proc, self.gpu, self.state = proc, bool(msg.get("gpu")), "ready"
+            threading.Thread(target=self._read, args=(proc,), daemon=True).start()
+            log.info("Orpheus ready (%s, gpu=%s).", dev, self.gpu)
+            if dev != "cpu" and not self.gpu:
+                log.warning("Orpheus is running on the CPU: llama.cpp could not use the GPU.")
+
+    def _read(self, proc: subprocess.Popen) -> None:
+        """Route the worker's messages to the stream waiting for each request id."""
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            q = self.queues.get(msg.get("id"))
+            if q is not None:
+                q.put(msg)
+        if self.proc is proc:  # died on its own
+            self.state, self.error = "error", "o processo do Orpheus fechou"
+            for q in list(self.queues.values()):
+                q.put({"error": self.error})
+
+    def _send(self, msg: dict, raw: bool = False) -> int:
+        with self.write_lock:
+            if not raw:
+                self._n += 1
+                msg = {"id": self._n, **msg}
+                self.queues[self._n] = queue.Queue()
+            try:
+                self.proc.stdin.write(json.dumps(msg) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, AttributeError, ValueError):
+                if not raw:
+                    self.queues[msg["id"]].put({"error": "o processo do Orpheus fechou"})
+            return msg.get("id", 0)
+
+    def _stats(self, msg: dict) -> None:
+        if msg.get("cancelled") or (msg.get("seconds") or 0) < 1:
+            return
+        rtf = msg["took"] / msg["seconds"]
+        self.rtf = round(rtf if self.rtf is None else 0.6 * self.rtf + 0.4 * rtf, 2)
+        self.tps = msg.get("tps")
+
+    def _hung(self) -> None:
+        self.stop()
+        self.state, self.error = "error", "o Orpheus parou de responder"
 
     def warm(self) -> None:
         threading.Thread(target=self.start, daemon=True).start()
@@ -207,34 +314,38 @@ class Worker:
             except Exception:  # noqa: BLE001
                 p.kill()
 
-    def synth(self, text: str, voice: str, timeout: float = 120) -> tuple[bytes, dict]:
+    def stream(self, text: str, voice: str) -> Stream:
         self.start()
         if self.state != "ready":
             raise RuntimeError(self.error or "Orpheus indisponível")
-        with self.lock:
-            self._n += 1
-            fd, out = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            try:
-                self.proc.stdin.write(json.dumps({"id": self._n, "text": text, "voice": voice, "out": out}) + "\n")
-                self.proc.stdin.flush()
-                res: list = []
-                t = threading.Thread(target=lambda: res.append(self.proc.stdout.readline()), daemon=True)
-                t.start()
-                t.join(timeout)
-                if not res or not res[0]:
-                    self.stop()
-                    self.state, self.error = "error", "o Orpheus parou de responder"
-                    raise RuntimeError(self.error)
-                msg = json.loads(res[0])
-                if not msg.get("ok"):
-                    raise RuntimeError(msg.get("error") or "falha ao gerar a voz")
-                return Path(out).read_bytes(), msg
-            finally:
-                Path(out).unlink(missing_ok=True)
+        return Stream(self, text, voice)
+
+    def synth(self, text: str, voice: str) -> bytes:
+        """The whole line as a WAV (used by the install test and when the speed is not 1×)."""
+        pcm = b"".join(self.stream(text, voice))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(ORPHEUS_SR)
+            w.writeframes(pcm)
+        return buf.getvalue()
 
 
 worker = Worker()
+
+
+def orpheus_ok() -> bool:
+    return installed("orpheus") and support("orpheus")["ok"]
+
+
+def stream(text: str, voice: str):
+    """PCM stream (16-bit mono, 24 kHz) of a character's line with Orpheus. Raises before the first byte if the
+    engine can't speak, so the caller can fall back to a WAV."""
+    if not orpheus_ok():
+        raise RuntimeError("Orpheus não está disponível neste computador.")
+    voice = prompts.voice(voice)
+    return worker.stream(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"))
 
 
 def synth(text: str, voice: str, speed: float = 1.0, engine: str | None = None) -> tuple[bytes, dict]:
@@ -244,10 +355,10 @@ def synth(text: str, voice: str, speed: float = 1.0, engine: str | None = None) 
     voice = prompts.voice(voice)
     engine = engine or active()
     if engine == "orpheus":
-        if not installed("orpheus") or not support("orpheus")["ok"]:
+        if not orpheus_ok():
             raise RuntimeError("Orpheus não está disponível neste computador.")
         try:
-            wav, _ = worker.synth(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"))
+            wav = worker.synth(_orpheus_text(text), ORPHEUS_VOICE.get(voice, "tara"))
             # Orpheus has no speed control: the browser applies the speed while playing.
             return wav, {"engine": "orpheus", "speed_applied": False, "fallback": ""}
         except Exception as e:  # noqa: BLE001
@@ -362,11 +473,17 @@ class Install:
         worker.start()
         if worker.state != "ready":
             raise RuntimeError(worker.error)
-        _, msg = worker.synth("Oh wow, that's great news! <laugh> I'm really happy for you.", "tara")
-        rtf = msg["took"] / max(msg["seconds"], 0.1)
-        ORPHEUS_MARK.write_text(json.dumps({"ok": True, "rtf": round(rtf, 2), "at": time.time()}), encoding="utf-8")
-        self._set("test", status="done",
-                  detail=f"{msg['took']:.0f} s para gerar {msg['seconds']:.0f} s de fala".replace(".", ","))
+        t0, first, pcm = time.time(), None, 0
+        for chunk in worker.stream("Oh wow, that's great news! <laugh> I'm really happy for you.", "tara"):
+            first = first or time.time() - t0
+            pcm += len(chunk)
+        took, seconds = time.time() - t0, pcm / 2 / ORPHEUS_SR
+        rtf = took / max(seconds, 0.1)
+        ORPHEUS_MARK.write_text(json.dumps({"ok": True, "rtf": round(rtf, 2), "gpu": worker.gpu, "at": time.time()}),
+                                encoding="utf-8")
+        where = "" if worker.gpu or support("orpheus")["device"] == "cpu" else " · rodando no processador, sem a GPU"
+        self._set("test", status="done", detail=(f"começa a falar em {first or 0:.1f} s · {took:.0f} s para gerar "
+                                                 f"{seconds:.0f} s de fala{where}").replace(".", ","))
         if config.TTS_ENGINE != "orpheus":
             worker.stop()
 
@@ -402,7 +519,10 @@ def overview() -> dict:
     for eid, e in ENGINES.items():
         item = {"id": eid, **e, "support": support(eid), "installed": installed(eid)}
         if eid == "orpheus":
-            rtf = _mark().get("rtf")
-            item.update(rtf=rtf, job=install.snapshot(), worker=worker.state, worker_error=worker.error)
+            mark = _mark()
+            gpu = worker.gpu if worker.gpu is not None else mark.get("gpu")
+            item.update(rtf=worker.rtf or mark.get("rtf"), job=install.snapshot(), worker=worker.state,
+                        worker_error=worker.error,
+                        on_cpu=gpu is False and support(eid)["device"] != "cpu")
         out.append(item)
     return {"chosen": config.TTS_ENGINE, "active": active(), "engines": out}

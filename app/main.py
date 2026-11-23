@@ -5,9 +5,9 @@ import json
 import logging
 import threading
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -125,7 +125,8 @@ def status():
             "track": config.TRACK,
             "setup_done": flags["setup_done"], "onboarding_done": flags["onboarding_done"],
             "installing": setup_mod.job.running,
-            "voice_engine": voices.active(), "voice_rtf": voices._mark().get("rtf") if voices.active() == "orpheus" else None}
+            "voice_engine": voices.active(),
+            "voice_rtf": (voices.worker.rtf or voices._mark().get("rtf")) if voices.active() == "orpheus" else None}
 
 
 # ---------- first-run setup & settings ----------
@@ -398,6 +399,37 @@ async def speak(req: TTSReq):
     return Response(wav, media_type="audio/wav", headers={
         "X-TTS-Engine": meta["engine"], "X-TTS-Speed": "native" if meta["speed_applied"] else "browser",
         "X-TTS-Fallback": "1" if meta["fallback"] else ""})
+
+
+class StreamReq(BaseModel):
+    text: str
+    voice: str = "af_heart"
+
+
+@app.post("/api/tts/stream")
+async def speak_stream(req: StreamReq, request: Request):
+    """Orpheus line as raw PCM (s16le, mono, 24 kHz), sent while it is generated so playback starts early.
+    Closing the request (the learner interrupted) cancels what is left."""
+    try:
+        st = await run_in_threadpool(voices.stream, req.text, req.voice)
+        it = iter(st)
+        first = await run_in_threadpool(next, it, b"")
+    except RuntimeError as e:
+        raise HTTPException(503, str(e)) from e
+
+    async def body():
+        try:
+            chunk = first
+            # uvicorn doesn't fail the send when the browser hangs up, so check explicitly: an interrupted
+            # line must stop generating right away, or the next line waits behind it.
+            while chunk and not await request.is_disconnected():
+                yield chunk
+                chunk = await run_in_threadpool(next, it, b"")
+        finally:
+            st.close()
+
+    return StreamingResponse(body(), media_type="audio/L16;rate=24000;channels=1",
+                             headers={"X-TTS-Engine": "orpheus", "X-Sample-Rate": "24000", "Cache-Control": "no-store"})
 
 
 # ---------- voice engines (Kokoro neutral, Orpheus expressive) ----------

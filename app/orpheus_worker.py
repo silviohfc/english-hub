@@ -3,23 +3,35 @@
 Runs inside Orpheus's own Python environment (models/engines/orpheus/.venv, see app/voices.py), never inside the
 app's: it only needs llama-cpp-python (GGUF on Metal or CUDA), onnxruntime (SNAC audio decoder) and numpy.
 
-Protocol: JSON lines. The worker prints {"ready": true} once the model is loaded, then for each request
-{"id", "text", "voice", "out"} writes a 24 kHz mono WAV to `out` and answers {"id", "ok", "seconds", "took"} or
-{"id", "ok": false, "error"}. Library chatter goes to stderr so stdout stays clean for the protocol.
+Protocol (JSON lines):
+  -> {"id", "text", "voice"}             synthesize, streaming the audio back as it is generated
+  -> {"cancel": id}                      stop that request early (the learner interrupted)
+  <- {"ready": true, "gpu": bool}        once the model is loaded
+  <- {"id", "pcm": base64}               16-bit mono PCM at 24 kHz, in order
+  <- {"id", "done": true, "seconds", "took", "tps"} or {"id", "error"}
+Library chatter goes to stderr so stdout stays clean for the protocol.
+
+Speed: tokens are read as ids (no detokenizing), and SNAC decodes blocks of frames in a second thread while the
+model keeps generating, instead of one 4-frame window per frame.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import glob
 import json
 import os
+import queue
 import sys
+import threading
 import time
-import wave
 
 SR = 24_000
-# Orpheus speaks these sounds when they appear in the text.
-TAGS = ("laugh", "chuckle", "sigh", "gasp", "groan", "yawn", "cough", "sniffle")
+FRAME = 2048            # samples per SNAC frame (7 audio tokens)
+AUDIO_BASE = 128266     # id of <custom_token_10>, the first audio code
+END_OF_SPEECH = 128258  # <custom_token_2>
+EOT = 128009            # <|eot_id|>
+BLOCKS = (4, 8, 16)     # frames per decoded block: small first, so playback starts early
 
 
 def _protocol_stream():
@@ -41,70 +53,85 @@ def _cuda_dlls() -> None:
 
 class Orpheus:
     def __init__(self, model: str, snac: str, gpu_layers: int) -> None:
+        import llama_cpp
         import onnxruntime
-        from llama_cpp import Llama
 
-        self.llm = Llama(model_path=model, n_ctx=4096, n_gpu_layers=gpu_layers, verbose=False, n_batch=512)
-        self.snac = onnxruntime.InferenceSession(snac, providers=["CPUExecutionProvider"])
+        self.gpu = bool(llama_cpp.llama_supports_gpu_offload()) and gpu_layers != 0
+        self.llm = llama_cpp.Llama(model_path=model, n_ctx=4096, n_gpu_layers=gpu_layers, verbose=False, n_batch=512)
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = max(2, (os.cpu_count() or 4) // 2)
+        self.snac = onnxruntime.InferenceSession(snac, sess_options=opts, providers=["CPUExecutionProvider"])
         self.snac_inputs = [i.name for i in self.snac.get_inputs()]
 
-    # -- audio tokens --
-    @staticmethod
-    def _token_id(piece: str, index: int) -> int | None:
-        start = piece.rfind("<custom_token_")
-        if start < 0 or not piece.endswith(">"):
-            return None
-        try:
-            return int(piece[start + 14:-1]) - 10 - ((index % 7) * 4096)
-        except ValueError:
-            return None
-
-    def _decode(self, frames: list[int]):
-        """SNAC decode of 4 frames (28 codes); returns the samples of the second-to-last frame (sliding window)."""
+    def _decode(self, frames: list[list[int]]):
         import numpy as np
 
-        n = len(frames) // 7
         c0, c1, c2 = [], [], []
-        for j in range(n):
-            f = frames[7 * j: 7 * j + 7]
+        for f in frames:
             c0.append(f[0])
             c1 += [f[1], f[4]]
             c2 += [f[2], f[3], f[5], f[6]]
         codes = [np.array([c], dtype=np.int64) for c in (c0, c1, c2)]
-        if any(((c < 0) | (c > 4096)).any() for c in codes):
-            return None
-        audio = self.snac.run(None, dict(zip(self.snac_inputs, codes)))[0]
-        return audio[0, 0, 2048:4096]
-
-    def synth(self, text: str, voice: str) -> "list":
-        import numpy as np
-
-        prompt = f"<|audio|>{voice}: {text}<|eot_id|><custom_token_4>"
-        max_tokens = min(3000, 400 + 14 * len(text))  # ~1 s of audio per 84 tokens
-        codes: list[int] = []
-        chunks = []
-        for part in self.llm(prompt, max_tokens=max_tokens, stream=True, temperature=0.6, top_p=0.9, top_k=40,
-                             min_p=0.05, repeat_penalty=1.1):
-            tok = self._token_id(part["choices"][0]["text"].strip(), len(codes))
-            if tok is None or tok <= 0:
-                continue
-            codes.append(tok)
-            if len(codes) % 7 == 0 and len(codes) > 27:
-                a = self._decode(codes[-28:])
-                if a is not None:
-                    chunks.append(a)
-        if not chunks:
-            raise RuntimeError("o Orpheus não gerou áudio para esse texto")
-        audio = np.concatenate(chunks)
+        audio = self.snac.run(None, dict(zip(self.snac_inputs, codes)))[0][0, 0]
         return np.clip(audio * 32767, -32768, 32767).astype(np.int16)
 
+    def stream(self, text: str, voice: str, cancelled):
+        """Yield PCM chunks (int16 arrays) for `text` while it is being generated."""
+        prompt = self.llm.tokenize(f"<|audio|>{voice}: {text}<|eot_id|><custom_token_4>".encode(),
+                                   add_bos=True, special=True)
+        max_tokens = min(3500, 600 + 16 * len(text))  # ~84 tokens per second of speech
+        frames: list[list[int]] = []
+        state = {"done": False, "error": None, "tokens": 0}
+        lock = threading.Lock()
 
-def _write_wav(path: str, samples) -> None:
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SR)
-        w.writeframes(samples.tobytes())
+        def generate():
+            cur: list[int] = []
+            try:
+                for n, tok in enumerate(self.llm.generate(prompt, top_k=40, top_p=0.9, min_p=0.05, temp=0.6,
+                                                          repeat_penalty=1.1, reset=True)):
+                    state["tokens"] = n + 1
+                    if tok in (END_OF_SPEECH, EOT) or n >= max_tokens or cancelled():
+                        break
+                    code = tok - AUDIO_BASE - len(cur) * 4096
+                    if not 0 <= code < 4096:
+                        continue  # not an audio code (or out of place): skip it like the reference decoder
+                    cur.append(code)
+                    if len(cur) == 7:
+                        with lock:
+                            frames.append(cur)
+                        cur = []
+            except Exception as e:  # noqa: BLE001
+                state["error"] = e
+            state["done"] = True
+
+        t = threading.Thread(target=generate, daemon=True)
+        t.start()
+        emitted, block = 0, 0
+        while True:
+            with lock:
+                n = len(frames)
+            finished = state["done"]
+            size = BLOCKS[min(block, len(BLOCKS) - 1)]
+            # A block of frames [emitted, end) needs 1 frame of context on the left and 2 on the right.
+            end = n if finished else min(n - 2, emitted + size)
+            if end - emitted >= (1 if finished else size):
+                left = 1 if emitted else 0
+                right = min(2, n - end)
+                with lock:
+                    window = frames[emitted - left:end + right]
+                pcm = self._decode(window)
+                yield pcm[left * FRAME:(left + end - emitted) * FRAME]
+                emitted, block = end, block + 1
+                continue
+            if finished:
+                break
+            time.sleep(0.01)
+        t.join()
+        if state["error"]:
+            raise state["error"]
+        if not emitted and not cancelled():
+            raise RuntimeError("o Orpheus não gerou áudio para esse texto")
+        self.last_tokens = state["tokens"]
 
 
 def main() -> None:
@@ -114,10 +141,12 @@ def main() -> None:
     ap.add_argument("--gpu-layers", type=int, default=-1)
     args = ap.parse_args()
     proto = _protocol_stream()
+    out_lock = threading.Lock()
 
     def say(obj: dict) -> None:
-        proto.write(json.dumps(obj) + "\n")
-        proto.flush()
+        with out_lock:
+            proto.write(json.dumps(obj) + "\n")
+            proto.flush()
 
     try:
         _cuda_dlls()
@@ -125,18 +154,40 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         say({"ready": False, "error": f"{type(e).__name__}: {e}"})
         return
-    say({"ready": True})
-    for line in sys.stdin:
-        if not line.strip():
+    say({"ready": True, "gpu": engine.gpu})
+
+    # stdin is read in its own thread so a cancel can arrive while a request is being generated.
+    jobs: queue.Queue = queue.Queue()
+    cancels: set = set()
+
+    def reader():
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            if "cancel" in msg:
+                cancels.add(msg["cancel"])
+            else:
+                jobs.put(msg)
+        jobs.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    while (req := jobs.get()) is not None:
+        rid = req.get("id")
+        if rid in cancels:
+            say({"id": rid, "done": True, "seconds": 0, "took": 0, "tps": 0, "cancelled": True})
             continue
-        req = json.loads(line)
-        t0 = time.time()
+        t0, samples = time.time(), 0
         try:
-            samples = engine.synth(req["text"], req["voice"])
-            _write_wav(req["out"], samples)
-            say({"id": req["id"], "ok": True, "seconds": round(len(samples) / SR, 2), "took": round(time.time() - t0, 2)})
+            for pcm in engine.stream(req["text"], req["voice"], lambda: rid in cancels):
+                samples += len(pcm)
+                say({"id": rid, "pcm": base64.b64encode(pcm.tobytes()).decode()})
+            took = time.time() - t0
+            say({"id": rid, "done": True, "seconds": round(samples / SR, 2), "took": round(took, 2),
+                 "tps": round(getattr(engine, "last_tokens", 0) / max(took, 0.01), 1), "cancelled": rid in cancels})
         except Exception as e:  # noqa: BLE001
-            say({"id": req.get("id"), "ok": False, "error": f"{type(e).__name__}: {e}"})
+            say({"id": rid, "error": f"{type(e).__name__}: {e}"})
+        cancels.discard(rid)
 
 
 if __name__ == "__main__":

@@ -120,7 +120,7 @@ const isDev = () => (FLAGS?.track || "dev") !== "daily";
 // audio
 // =====================================================================
 let currentAudio = null;
-function stopAudio() { speakToken++; if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
+function stopAudio() { speakToken++; currentStream?.stop(); currentStream = null; if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
 
 // Live audio level (0..1) from any audio node, like the speaking indicator of meeting apps.
 let actx = null;
@@ -151,7 +151,71 @@ let speakLevel = null; // set by the call screen to animate the partner's portra
 
 // Voice engine in use ("kokoro" neutral, "orpheus" expressive); kept fresh by pollStatus and the settings page.
 let VOICE_ENGINE = "kokoro";
+let VOICE_RTF = null; // Orpheus: generation time / speech time measured on this computer
 let speakToken = 0;
+let currentStream = null; // a streamed line being played (Orpheus)
+// Orpheus streams at its natural pace; the speed setting only switches to the (slower to start) WAV path when it
+// is far from 1×, because Web Audio can't change the speed without changing the pitch.
+const streamable = (engine) => engine === "orpheus" && Math.abs(settings.speed - 1) <= 0.1;
+
+// Plays a line from /api/tts/stream (raw 16-bit PCM, 24 kHz) while it is generated. Waits for a small buffer when
+// this computer generates slower than real time, so the voice doesn't stutter.
+async function streamSpeak(text, voice, token, onStart) {
+  const ctx = audioCtx();
+  if (ctx.state !== "running") await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]);
+  if (ctx.state !== "running") throw new Error("audio context not running");
+  const ctrl = new AbortController();
+  const res = await fetch("/api/tts/stream", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice }), signal: ctrl.signal });
+  if (!res.ok) throw new Error("stream unavailable");
+  const out = ctx.createGain();
+  out.connect(ctx.destination);
+  const stopMeter = speakLevel ? meter(out, speakLevel) : null;
+  const rtf = VOICE_RTF || 1;
+  const est = text.replace(/<[^>]+>/g, "").length / 14; // ~14 characters per second of speech
+  const prebuffer = rtf <= 0.85 ? 0.25 : Math.min(8, est * (1 - 1 / rtf) + 0.4);
+  const sources = [], pending = [];
+  let started = false, end = 0, buffered = 0, rest = new Uint8Array(0), stopped = false;
+  const stream = { stop() { stopped = true; ctrl.abort(); sources.forEach((x) => { try { x.stop(); } catch { /* ignore */ } }); } };
+  currentStream = stream;
+  const schedule = (buf) => {
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(out);
+    const at = Math.max(end, ctx.currentTime + 0.03);
+    src.start(at);
+    end = at + buf.duration;
+    sources.push(src);
+  };
+  const begin = () => { started = true; onStart?.(); pending.splice(0).forEach(schedule); };
+  try {
+    const reader = res.body.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || stopped || token !== speakToken) break;
+      const bytes = new Uint8Array(rest.length + value.length);
+      bytes.set(rest); bytes.set(value, rest.length);
+      const n = bytes.length >> 1;
+      rest = bytes.slice(n * 2);
+      if (!n) continue;
+      const dv = new DataView(bytes.buffer, 0, n * 2), f = new Float32Array(n);
+      for (let i = 0; i < n; i++) f[i] = dv.getInt16(i * 2, true) / 32768;
+      const buf = ctx.createBuffer(1, n, 24000);
+      buf.copyToChannel(f, 0);
+      buffered += buf.duration;
+      if (started) schedule(buf);
+      else { pending.push(buf); if (buffered >= prebuffer) begin(); }
+    }
+    if (!started && !stopped && token === speakToken) begin();
+    while (!stopped && token === speakToken && ctx.currentTime < end) await new Promise((r) => setTimeout(r, 80));
+  } catch (e) {
+    // Before the first sound, let the caller fall back to the WAV path; after it, just end the line.
+    if (!stopped && e.name !== "AbortError" && !started) throw e;
+  } finally {
+    stopMeter?.();
+    if (currentStream === stream) currentStream = null;
+  }
+}
 // A slow expressive engine speaks sentence by sentence: the next one is generated while the current one plays.
 function sentenceChunks(text) {
   const parts = (text.match(/[^.!?…]+(?:[.!?…]+["')\]]*|$)\s*/g) || [text]).map((x) => x.trim()).filter(Boolean);
@@ -196,6 +260,10 @@ async function playAudio(audio) {
 async function speak(text, voice, { engine, onStart } = {}) {
   stopAudio();
   const token = speakToken;
+  if (streamable(engine || VOICE_ENGINE)) {
+    try { return await streamSpeak(text, voice, token, onStart); }
+    catch (e) { if (token !== speakToken) return; /* otherwise fall back to the WAV path below */ }
+  }
   const parts = (engine || VOICE_ENGINE) === "orpheus" ? sentenceChunks(text) : [text];
   let next = ttsAudio(parts[0], voice, engine);
   for (let i = 0; i < parts.length; i++) {
@@ -302,6 +370,7 @@ async function pollStatus() {
     const s = await api("/api/status");
     FLAGS = { ...(FLAGS || {}), setup_done: s.setup_done, onboarding_done: s.onboarding_done, track: s.track };
     VOICE_ENGINE = s.voice_engine || "kokoro";
+    VOICE_RTF = s.voice_rtf;
     if (!s.setup_done) { el.textContent = "configuração pendente"; el.className = "status"; setTimeout(pollStatus, 4000); return; }
     if (s.stt && s.tts) {
       el.textContent = "pronto para falar";
@@ -1833,7 +1902,8 @@ function engineCardHTML(e, v, ui) {
   const kind = e.emotion ? `<span class="pill sub">${ic("sparkles")} Com emoção</span>` : `<span class="pill">Voz neutra</span>`;
   let speed = "";
   if (e.id === "kokoro") speed = "Responde na hora.";
-  else if (e.rtf) speed = `Neste computador, gerar a fala leva ${e.rtf.toFixed(1).replace(".", ",")}× a duração dela: o personagem demora alguns segundos a mais para responder.`;
+  else if (e.rtf && e.rtf <= 0.9) speed = "Neste computador, gera a fala mais rápido do que ela é falada: começa a falar em cerca de 1 s.";
+  else if (e.rtf) speed = `Neste computador, gerar a fala leva ${e.rtf.toFixed(1).replace(".", ",")}× a duração dela: o personagem começa a falar depois de alguns segundos.`;
   else speed = "Mais lenta que a Kokoro: o personagem demora alguns segundos a mais para responder.";
   let acts = "";
   if (!sup.ok) acts = "";
@@ -1841,7 +1911,8 @@ function engineCardHTML(e, v, ui) {
       <button class="btn" data-eng="install-yes">Instalar</button><button class="btn btn-ghost" data-eng="install-no">Cancelar</button>`;
   else if (!e.installed) acts = running ? "" : `<button class="btn" data-eng="install">${ic("download")} Instalar (${fmtBytes(e.size_mb * 1e6)})</button>`;
   else acts = `<button class="btn" data-eng="sample" data-id="${e.id}" ${ui.playing ? "disabled" : ""}>${ic("play")} ${ui.playing === e.id ? "Gerando…" : "Ouvir exemplo"}</button>
-      ${on ? "" : `<button class="btn" data-eng="use" data-id="${e.id}">${ic("check")} Usar esta voz</button>`}`;
+      ${on ? "" : `<button class="btn" data-eng="use" data-id="${e.id}">${ic("check")} Usar esta voz</button>`}
+      ${e.id === "orpheus" && !running ? `<button class="link-btn" data-eng="install-yes">Reinstalar e testar</button>` : ""}`;
   const showJob = sup.ok && e.id === "orpheus" && job && job.status !== "idle" && !(job.status === "done" && e.installed && !ui.justInstalled);
   return `<div class="engine ${on ? "on" : ""} ${sup.ok ? "" : "off"}" ${sup.ok ? "" : 'aria-disabled="true"'}>
     <div class="eng-head"><b>${esc(e.label)}</b>${kind}${on ? `<span class="pill ok">${ic("check")} Em uso</span>` : ""}</div>
@@ -1849,6 +1920,8 @@ function engineCardHTML(e, v, ui) {
     <p class="d muted">${esc(e.voices)} · ${esc(speed)}</p>
     ${sup.ok ? "" : `<p class="eng-off">${ic("ban")} Desativada neste computador. ${esc(sup.reason)}</p>`}
     ${loading ? `<div class="d">Carregando o Orpheus na GPU…</div>${strip(16, "sm busy")}` : ""}
+    ${e.on_cpu ? `<p class="warn-line">O Orpheus está rodando no processador: o llama.cpp não conseguiu usar a placa de vídeo, por isso a fala demora. Atualize o driver da NVIDIA (551 ou mais novo), reinicie o app e clique em Reinstalar e testar.</p>` : ""}
+    ${e.id === "orpheus" && e.installed && Math.abs(settings.speed - 1) > 0.1 ? `<p class="d muted">Com a velocidade da voz em ${settings.speed.toFixed(2).replace(".", ",")}×, a fala só começa quando a frase inteira fica pronta. Entre 0,90× e 1,10× ela começa logo, na velocidade natural.</p>` : ""}
     ${e.worker === "error" && on ? `<p class="warn-line">O Orpheus não carregou (${esc(e.worker_error)}). Enquanto isso, os personagens falam com a Kokoro.</p>` : ""}
     ${showJob ? `<div class="jobs">${job.items.map(jobRowHTML).join("")}</div>` : ""}
     ${acts ? `<div class="row">${acts}</div>` : ""}</div>`;
@@ -1859,6 +1932,7 @@ function voicePanel(root) {
   function paint() {
     if (!v) { root.innerHTML = `<p class="muted">Verificando o que este computador aguenta…</p>`; return; }
     VOICE_ENGINE = v.active;
+    VOICE_RTF = v.engines.find((e) => e.id === "orpheus")?.rtf ?? VOICE_RTF;
     root.innerHTML = `<div class="engines">${v.engines.map((e) => engineCardHTML(e, v, ui)).join("")}</div>`;
   }
   async function load() {
