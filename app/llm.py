@@ -19,9 +19,21 @@ import sys
 import tempfile
 import threading
 
-from . import config, providers
+from . import config, providers, telemetry
 
 log = logging.getLogger("llm")
+_meta = threading.local()  # what the last CLI run reported about itself (durations, tokens), for telemetry
+
+
+def _result_meta(ev: dict) -> dict:
+    """The timing and usage numbers of a Claude CLI result event."""
+    usage = ev.get("usage") or {}
+    return {"cli_duration_ms": ev.get("duration_ms"), "api_duration_ms": ev.get("duration_api_ms"),
+            "num_turns": ev.get("num_turns"), "cost_usd": ev.get("total_cost_usd"),
+            "input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens"),
+            "cache_read_tokens": usage.get("cache_read_input_tokens"),
+            "cache_write_tokens": usage.get("cache_creation_input_tokens"),
+            "stop_reason": ev.get("stop_reason") or ev.get("subtype")}
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 ROLES = providers.ROLES
@@ -86,11 +98,13 @@ class ClaudeChat:
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--include-partial-messages",
         ]
+        self.model = model
         self._proc = subprocess.Popen(
             args, cwd=config.CLAUDE_WORKDIR,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW, env=_env(),
         )
+        self.turns = 0
         self._lock = threading.Lock()
         self._stderr: list[str] = []
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -105,17 +119,24 @@ class ClaudeChat:
     def send(self, text: str) -> str:
         return "".join(self.stream(text)).strip()
 
-    def stream(self, text: str):
+    def stream(self, text: str, trace=telemetry.NULL):
         """Yield the reply as it is written (text deltas from --include-partial-messages). The turn is always read
-        to its end, even if the caller stops early, so the next turn starts clean."""
+        to its end, even if the caller stops early, so the next turn starts clean. With a telemetry `trace`, every
+        step of the CLI's stream is recorded (request written, API response start, each text delta, result)."""
+        t_wait = telemetry.now_ms()
         with self._lock:
+            trace.add_span("llm.lock_wait", t_wait)
             if self._proc.poll() is not None:
                 raise LLMError("Claude process exited: " + "".join(self._stderr[-5:]))
+            self.turns += 1
             msg = {"type": "user", "message": {"role": "user", "content": text}}
             self._proc.stdin.write(json.dumps(msg) + "\n")
             self._proc.stdin.flush()
+            trace.mark("llm.sent", provider="claude", model=self.model, chars=len(text), session_turn=self.turns,
+                       text=text)
             parts: list[str] = []
             streamed, done = False, False
+            n_delta = 0
             try:
                 for line in self._proc.stdout:
                     line = line.strip()
@@ -127,16 +148,31 @@ class ClaudeChat:
                         continue
                     kind = ev.get("type")
                     if kind == "stream_event":
-                        delta = (ev.get("event") or {}).get("delta") or {}
+                        inner = ev.get("event") or {}
+                        delta = inner.get("delta") or {}
                         if delta.get("type") == "text_delta" and delta.get("text"):
                             streamed = True
+                            n_delta += 1
+                            trace.mark("llm.first_text" if n_delta == 1 else "llm.delta", n=n_delta,
+                                       chars=len(delta["text"]), text=delta["text"])
                             yield delta["text"]
+                        elif inner.get("type") == "message_start":
+                            usage = (inner.get("message") or {}).get("usage") or {}
+                            trace.mark("llm.message_start", input_tokens=usage.get("input_tokens"),
+                                       cache_read_tokens=usage.get("cache_read_input_tokens"),
+                                       cache_write_tokens=usage.get("cache_creation_input_tokens"))
+                        elif inner.get("type") in ("message_delta", "message_stop", "content_block_stop"):
+                            trace.mark("llm." + inner["type"], stop_reason=delta.get("stop_reason"),
+                                       output_tokens=(inner.get("usage") or {}).get("output_tokens"))
                     elif kind == "assistant" and not streamed:
                         for block in ev.get("message", {}).get("content", []):
                             if block.get("type") == "text":
                                 parts.append(block["text"])
+                    elif kind == "system":
+                        trace.mark("llm.system", subtype=ev.get("subtype"))
                     elif kind == "result":
                         done = True
+                        trace.mark("llm.result", deltas=n_delta, error=bool(ev.get("is_error")), **_result_meta(ev))
                         if ev.get("is_error"):
                             raise LLMError(str(ev.get("result") or ev.get("subtype")))
                         if not streamed:  # an older CLI without partial messages: the whole reply at once
@@ -168,6 +204,7 @@ def _claude_run(prompt: str, system_prompt: str, model: str, timeout: int, tools
         data = json.loads(res.stdout)
     except json.JSONDecodeError as e:
         raise LLMError(f"Resposta inválida do Claude: {res.stdout[:300]} {res.stderr[:300]}") from e
+    _meta.last = _result_meta(data)
     if data.get("is_error"):
         raise LLMError(str(data.get("result")))
     out = data.get("structured_output")
@@ -276,17 +313,34 @@ _RUNNERS = {"claude": _claude_run, "codex": _codex_run, "gemini": _agy_run}
 
 
 def _call(prompt: str, system_prompt: str, target: str | None, timeout: int, tools: str,
-          schema: dict | None = None) -> tuple[str, dict | None]:
+          schema: dict | None = None, trace=None) -> tuple[str, dict | None]:
+    """Runs one CLI call, recorded as a span of `trace` or, without one, as its own "llm" trace."""
     pid, model = _target(target)
-    return _RUNNERS[pid](prompt, system_prompt, model, timeout, tools, schema)
+    own = trace is None
+    tr = telemetry.start("llm", role=target if target in ROLES else "", provider=pid, model=model) if own else trace
+    _meta.last = {}
+    attrs = {"provider": pid, "model": model, "role": target if target in ROLES else "", "prompt_chars": len(prompt),
+             "system_chars": len(system_prompt), "tools": tools, "schema": bool(schema)}
+    try:
+        with tr.span("llm.call", **attrs) as sp:
+            text, data = _RUNNERS[pid](prompt, system_prompt, model, timeout, tools, schema)
+            sp.update(reply_chars=len(text), structured=data is not None, **(getattr(_meta, "last", {}) or {}))
+    except Exception as e:
+        if own:
+            tr.finish(ok=False, error=f"{type(e).__name__}: {e}"[:300])
+        raise
+    if own:
+        tr.finish(ok=True, reply_chars=len(text), **(getattr(_meta, "last", {}) or {}))
+    return text, data
 
 
 # =============================================================================================
 # public API
 # =============================================================================================
-def ask(prompt: str, system_prompt: str, model: str | None = None, timeout: int = 300, tools: str = "") -> str:
+def ask(prompt: str, system_prompt: str, model: str | None = None, timeout: int = 300, tools: str = "",
+        trace=None) -> str:
     """`model` is a role (chat/feedback/helper) or, for compatibility, a Claude model name."""
-    return _call(prompt, system_prompt, model, timeout, tools)[0]
+    return _call(prompt, system_prompt, model, timeout, tools, trace=trace)[0]
 
 
 def ask_json(prompt: str, system_prompt: str, model: str | None = None, tools: str = "",
@@ -331,7 +385,7 @@ class HistoryChat:
         self.turns: list[tuple[str, str]] = []
         self._lock = threading.Lock()
 
-    def send(self, text: str) -> str:
+    def send(self, text: str, trace=None) -> str:
         with self._lock:
             if text == "[START]":
                 prompt = "The call is starting now. Say your natural opening line."
@@ -339,14 +393,14 @@ class HistoryChat:
                 so_far = "\n".join(f"{'LEARNER' if who == 'user' else 'YOU'}: {t}" for who, t in self.turns)
                 prompt = (f"Conversation so far:\n{so_far}\n\n" if so_far else "") + f"LEARNER: {text}\n\n" \
                          "Write ONLY your next spoken reply (plain text, in character)."
-            reply = ask(prompt, self.system, self.role, timeout=120)
+            reply = ask(prompt, self.system, self.role, timeout=120, trace=trace)
             if text != "[START]":
                 self.turns.append(("user", text))
             self.turns.append(("assistant", reply))
             return reply
 
-    def stream(self, text: str):
-        yield self.send(text)
+    def stream(self, text: str, trace=telemetry.NULL):
+        yield self.send(text, trace)
 
     def close(self) -> None:
         pass

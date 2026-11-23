@@ -10,7 +10,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config
+from . import config, telemetry
 
 log = logging.getLogger("stt")
 
@@ -111,6 +111,17 @@ class STT:
     def load(self, skip_gpu: bool = False) -> None:
         if self._model is not None:
             return
+        tr = telemetry.start("load", what="whisper")
+        try:
+            with tr.span("load.whisper") as sp:
+                self._load(skip_gpu)
+                sp.update(model=self.model_name, device=self.device, compute=self.compute)
+            tr.finish(ok=True, model=self.model_name, device=self.device, compute=self.compute)
+        except Exception as e:
+            tr.finish(ok=False, error=str(e)[:300])
+            raise
+
+    def _load(self, skip_gpu: bool = False) -> None:
         _add_cuda_dll_dirs()
         import numpy as np
         from faster_whisper import WhisperModel
@@ -134,15 +145,24 @@ class STT:
                 log.warning("Whisper on %s (%s) failed: %s", device, compute, e)
         raise RuntimeError(f"Could not load Whisper: {last_err}")
 
-    def transcribe(self, audio_bytes: bytes, language: str = "en") -> dict:
+    def transcribe(self, audio_bytes: bytes, language: str = "en", trace=telemetry.NULL) -> dict:
         """Returns {text, words:[{w,start,end,p}], duration}."""
-        self.load()
-        audio = decode_audio(audio_bytes)
+        with trace.span("stt.load_wait"):
+            self.load()
+        with trace.span("stt.decode", bytes=len(audio_bytes)) as sp:
+            audio = decode_audio(audio_bytes)
+            sp["audio_ms"] = round(audio.size / 16, 1)
         if audio.size < 1600:  # < 0.1 s
             return {"text": "", "words": [], "duration": 0}
+        t_lock = telemetry.now_ms()
         with self._lock:
+            trace.add_span("stt.lock_wait", t_lock)
             try:
-                return self._transcribe(audio, language)
+                with trace.span("stt.transcribe", model=self.model_name, device=self.device, compute=self.compute,
+                                language=language, audio_ms=round(audio.size / 16, 1)) as sp:
+                    out = self._transcribe(audio, language, trace)
+                    sp.update(words=len(out["words"]), chars=len(out["text"]), text=out["text"])
+                return out
             except RuntimeError as e:
                 # e.g. CUDA out of memory on a 4 GB laptop GPU: move to CPU and keep going.
                 if self.device == "cpu":
@@ -152,7 +172,7 @@ class STT:
                 self.load(skip_gpu=True)
                 return self._transcribe(audio, language)
 
-    def _transcribe(self, audio, language: str) -> dict:
+    def _transcribe(self, audio, language: str, trace=telemetry.NULL) -> dict:
         segments, info = self._model.transcribe(
             audio,
             language=language,
@@ -164,7 +184,14 @@ class STT:
             beam_size=5,
         )
         words, texts = [], []
-        for seg in segments:
+        t_seg = telemetry.now_ms()
+        trace.mark("stt.vad_done", duration_s=round(info.duration, 2),
+                   speech_s=round(getattr(info, "duration_after_vad", 0) or 0, 2))
+        for seg in segments:  # lazy: each segment is decoded when it is read
+            trace.add_span("stt.segment", t_seg, start_s=round(seg.start, 2), end_s=round(seg.end, 2),
+                           words=len(seg.words or []), no_speech=round(seg.no_speech_prob, 3),
+                           logprob=round(seg.avg_logprob, 3))
+            t_seg = telemetry.now_ms()
             texts.append(seg.text.strip())
             for w in seg.words or []:
                 words.append({"w": w.word.strip(), "start": round(w.start, 2),

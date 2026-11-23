@@ -143,15 +143,29 @@ reconhecedor entendeu com baixa confiança (sublinhadas). Isso indica clareza, n
   Instala pelas Configurações → Voz dos personagens, num ambiente Python próprio (`models/engines/orpheus`), e só
   fica liberada em Mac com Apple Silicon e 16 GB ou mais, ou em placa NVIDIA com 6 GB ou mais (no Windows). Na GTX 1650
   (4 GB) fica desativada: a VRAM já é do reconhecimento de voz. Tem 8 vozes, então personagens dividem voz.
-  Num M4 com 16 GB o Orpheus gera em ~2,3× a duração da fala, então pausas entre frases são inevitáveis; a
-  Kokoro não tem esse limite. Se o llama.cpp não usar a GPU, o cartão avisa. Se o Orpheus falhar, a fala volta
-  para a Kokoro sozinha.
+  No Windows com NVIDIA ele roda no `llama-server` do próprio llama.cpp (build fixado em `LLAMA_SERVER`, baixado na
+  instalação; instalações antigas o recebem sozinhas ao abrir o app). Ele gera duas frases ao mesmo tempo, então a
+  próxima fica pronta enquanto a atual toca. Numa RTX 3060 Ti gera em ~0,6× a duração da fala, sem pausas no meio. Se
+  o servidor não carregar, o worker volta para o llama-cpp-python no próprio processo (uma frase por vez), que é
+  também o caminho do Mac. Num M4 com 16 GB o Orpheus gera em ~2,3× a duração da fala, então pausas entre frases
+  são inevitáveis; a Kokoro não tem esse limite. O modelo abre cada frase com ~0,5 s de silêncio: o worker guarda os
+  quadros mudos de cada voz (`models/engines/orpheus/seeds.json`) e os devolve no prompt, e a voz começa ~0,3 s
+  antes. Se o llama.cpp não usar a GPU, o cartão avisa. Se o Orpheus falhar, a fala volta para a Kokoro sozinha.
 - **Voz em streaming (os dois motores):** `app/speech.py` corta o texto em frases assim que cada uma fica completa
   (a primeira curta, para a voz começar cedo; as seguintes maiores, porque cada corte custa um recomeço no Orpheus),
   remove o silêncio que o motor põe nas pontas e insere uma pausa pela pontuação. Tudo chega ao navegador no mesmo
   formato (PCM 24 kHz em quadros), e um player só toca qualquer motor, pausando apenas entre frases. Frases salvas e
   vocabulário são gerados uma vez por motor e ficam em `data/tts-cache/<motor>/`. Entre 0,90× e 1,10× o Orpheus
   sai em streaming; fora disso ele usa o WAV (o navegador muda a velocidade sem mudar o tom).
+- **Telemetria (local):** `app/telemetry.py` grava um *trace* por unidade de espera: cada turno da ligação, fala
+  avulsa, chamada da IA, transcrição e carregamento de modelo. Cada trace junta eventos do servidor (Whisper, cada
+  pedaço do texto do Claude e os tempos que a CLI informa, cortes de frase, áudio pronto e enviado), do worker do
+  Orpheus (fila, primeiro token, cada bloco decodificado, início da voz, tempos do llama-server), do navegador
+  (microfone, requisição, cada quadro recebido, cada bloco tocado, pausas, cortes) e da GPU (amostras do
+  `nvidia-smi` a cada 200 ms). Todos usam o relógio do sistema (epoch ms), então as linhas do tempo se alinham sem
+  conversão. Os arquivos ficam em `data/telemetry/<dia>/` (um JSON por trace, mais `requests.jsonl` com o tempo de
+  cada chamada da API). A página Configurações → Voz → *Ver a linha do tempo* (`#telemetry`) mostra a lista e a linha
+  do tempo de cada trace. `GET /api/telemetry/day/<AAAA-MM-DD>` baixa um dia inteiro em NDJSON para análise.
 - **Cérebro:** a CLI do seu plano. Só o **Claude tem streaming**: na chamada, cada fala é um fluxo único
   (`/api/session/{id}/turn/stream`) com a sua transcrição, o texto da resposta enquanto é escrito e a voz, que começa
   na primeira frase pronta, antes de a resposta terminar. Antigravity (`agy -p`) e Codex (`codex exec`) reenviam a
@@ -179,6 +193,8 @@ Valem como padrão; o que você escolhe na tela de configuração tem prioridade
 | `WHISPER_CPU_THREADS` | núcleos físicos | threads do Whisper na CPU |
 | `TTS_ENGINE` | `kokoro` | `kokoro` (neutra) ou `orpheus` (com emoção, se instalado e suportado) |
 | `ENGLISH_HUB_ORPHEUS_FORCE` | – | `1` libera o Orpheus mesmo fora dos requisitos (por sua conta) |
+| `ENGLISH_HUB_TELEMETRY` | `1` | `0` desliga a telemetria local (`data/telemetry`) |
+| `ENGLISH_HUB_TELEMETRY_DAYS` | `30` | dias de telemetria guardados (os mais antigos são apagados ao abrir o app) |
 | `PORT` | `8765` | porta do servidor |
 | `ENGLISH_HUB_NO_BROWSER` | – | `1` para não abrir o navegador ao iniciar |
 | `ENGLISH_HUB_DATA` / `ENGLISH_HUB_MODELS` | `data/`, `models/` | pastas de dados e modelos (os nomes antigos `DEV_ENGLISH_*` ainda valem) |

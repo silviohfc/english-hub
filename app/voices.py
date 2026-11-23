@@ -26,7 +26,7 @@ import time
 import wave
 from pathlib import Path
 
-from . import config, prompts
+from . import config, prompts, telemetry
 
 log = logging.getLogger("voices")
 WIN = sys.platform == "win32"
@@ -52,6 +52,19 @@ LLAMA_WHEEL = {
     "cuda": "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.4-cu124/"
             "llama_cpp_python-0.3.4-cp312-cp312-win_amd64.whl",
 }
+# llama.cpp's own server (Windows + NVIDIA): ~35% faster than the llama-cpp-python wheel above, and it generates the
+# next sentence while the current one plays. Only the binaries are kept; the CUDA runtime comes from the nvidia-*
+# wheels already in Orpheus's environment. Pinned: the build was measured on an RTX 3060 Ti (138 tok/s alone,
+# 262 tok/s for two lines at once).
+LLAMA_SERVER = {
+    "cuda": "https://github.com/ggml-org/llama.cpp/releases/download/b12651/llama-b12651-bin-win-cuda-12.4-x64.zip",
+}
+SERVER_DIR = ORPHEUS_DIR / "llama-server"
+SERVER_EXE = SERVER_DIR / ("llama-server.exe" if WIN else "llama-server")
+SERVER_MARK = SERVER_DIR / "build.txt"
+# Per voice, the silent frames the model opens a line with: given back in the prompt, the voice starts sooner
+# (see app/orpheus_worker.py). Written by the worker the first time each voice speaks.
+ORPHEUS_SEEDS = ORPHEUS_DIR / "seeds.json"
 # Orpheus ships 8 voices; each character uses the closest one (British characters get an American voice).
 ORPHEUS_VOICE = {
     "af_heart": "tara", "af_sarah": "tara", "bf_emma": "tara",
@@ -78,7 +91,7 @@ ENGINES = {
         "summary": "Fala com emoção: ri, suspira, se anima ou fica sério conforme a conversa. Tem 8 vozes, então "
                    "alguns personagens dividem a mesma voz, e os britânicos falam com sotaque americano.",
         "voices": "8 vozes compartilhadas entre os personagens",
-        "size_mb": 2600,
+        "size_mb": 2600 if not WIN else 2950,  # + llama-server download on Windows (~360 MB)
     },
 }
 
@@ -145,6 +158,80 @@ def _files() -> list[Path] | None:
     return out
 
 
+def server_ready() -> bool:
+    """llama-server for this computer is on disk (the worker then uses it instead of the in-process model)."""
+    dev = support("orpheus")["device"]
+    url = LLAMA_SERVER.get(dev)
+    try:
+        return bool(url) and SERVER_EXE.exists() and SERVER_MARK.read_text(encoding="utf-8").strip() == url
+    except OSError:
+        return False
+
+
+def fetch_server(progress=lambda got, total: None) -> None:
+    """Download and unpack llama-server (only the server and its libraries) into SERVER_DIR."""
+    import urllib.request
+    import zipfile
+
+    url = LLAMA_SERVER[support("orpheus")["device"]]
+    ORPHEUS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_zip, tmp_dir = ORPHEUS_DIR / "llama-server.zip.part", ORPHEUS_DIR / "llama-server.part"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, open(tmp_zip, "wb") as f:
+            total, got = int(r.headers.get("Content-Length") or 0) or None, 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                got += len(chunk)
+                progress(got, total)
+        with zipfile.ZipFile(tmp_zip) as z:
+            for name in z.namelist():
+                base = Path(name).name
+                # the server, its own -impl library and the shared libraries; not the other tools
+                keep = base.lower().endswith(".dll") and not (base.endswith("-impl.dll") and
+                                                             base != "llama-server-impl.dll")
+                if base == SERVER_EXE.name or keep or base.startswith("LICENSE"):
+                    (tmp_dir / base).parent.mkdir(parents=True, exist_ok=True)
+                    (tmp_dir / base).write_bytes(z.read(name))
+        if not (tmp_dir / SERVER_EXE.name).exists():
+            raise RuntimeError("o pacote do llama.cpp não tem o llama-server")
+        (tmp_dir / SERVER_MARK.name).write_text(url, encoding="utf-8")
+        was_running = worker.state in ("loading", "ready") and worker.uses_server
+        if was_running:
+            worker.stop()  # its llama-server holds the old files open
+        shutil.rmtree(SERVER_DIR, ignore_errors=True)
+        tmp_dir.replace(SERVER_DIR)
+        if was_running:
+            worker.warm()
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def upgrade_server() -> None:
+    """Installs made before llama-server existed get it in the background; the worker switches to it as soon as
+    it is idle (a line being spoken is never cut)."""
+    if not (installed("orpheus") and support("orpheus")["ok"]) or server_ready() \
+            or support("orpheus")["device"] not in LLAMA_SERVER or install.running:
+        return
+
+    def run():
+        try:
+            log.info("Downloading llama-server for Orpheus...")
+            fetch_server()
+        except Exception as e:  # noqa: BLE001
+            log.warning("llama-server download failed (Orpheus keeps the in-process model): %s", e)
+            return
+        log.info("llama-server installed.")
+        while worker.state in ("loading", "ready") and not worker.uses_server:
+            if not worker.queues:  # idle: restart on the server
+                worker.stop()
+                worker.warm()
+                return
+            time.sleep(2)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def installed(engine: str) -> bool:
     if engine == "kokoro":
         return config.KOKORO_MODEL.exists() and config.KOKORO_VOICES.exists()
@@ -172,10 +259,11 @@ def _chunks(text: str) -> list[str]:
 class Live:
     """One line being spoken by Orpheus: pieces are queued in the worker as they arrive (the next one is generated
     while the current one plays) and read back in order as they are generated.
-    Yields ("pcm", bytes) and ("end", index) after each piece."""
+    Yields ("pcm", bytes) and ("end", index) after each piece. With a telemetry `trace`, each request's timeline
+    (measured inside the worker) is added to it, also for requests that are cancelled."""
 
-    def __init__(self, w: "Worker", voice: str) -> None:
-        self.w, self.voice = w, voice
+    def __init__(self, w: "Worker", voice: str, trace=telemetry.NULL) -> None:
+        self.w, self.voice, self.trace = w, voice, trace
         self.ids: list[int] = []
         self.finished = self.closed = False
         self.cond = threading.Condition()
@@ -184,7 +272,10 @@ class Live:
         with self.cond:
             if self.closed or self.finished or not text.strip():
                 return
-            self.ids.append(self.w._send({"text": text, "voice": self.voice}))
+            piece = len(self.ids)
+            rid = self.w._send({"text": text, "voice": self.voice}, trace=(self.trace, piece))
+            self.ids.append(rid)
+            self.trace.mark("orpheus.request", piece=piece, rid=rid, chars=len(text), text=text)
             self.cond.notify_all()
 
     def finish(self) -> None:
@@ -253,7 +344,9 @@ class Worker:
         self.gpu: bool | None = None       # whether llama.cpp is really using the GPU
         self.rtf: float | None = None      # generation time / speech time, measured on real lines
         self.tps: float | None = None
+        self.uses_server = False           # llama-server (two lines at once) rather than the in-process model
         self.queues: dict[int, "queue.Queue"] = {}
+        self.traces: dict[int, tuple] = {}  # request id -> (telemetry trace, piece index)
         self._n = 0
 
     def start(self) -> None:
@@ -266,25 +359,42 @@ class Worker:
                 return
             dev = support("orpheus")["device"]
             self.state, self.error = "loading", ""
+            tr = telemetry.start("load", what="orpheus", device=dev)
             args = [str(ORPHEUS_PY), str(Path(__file__).with_name("orpheus_worker.py")),
                     "--model", str(files[0]), "--snac", str(files[1]),
-                    "--gpu-layers", "0" if dev == "cpu" else "-1"]
-            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW)
-            line = proc.stdout.readline()
-            try:
-                msg = json.loads(line) if line else {"ready": False, "error": "o processo do Orpheus fechou ao carregar"}
-            except ValueError:
-                msg = {"ready": False, "error": line.strip()[:200]}
-            if not msg.get("ready"):
+                    "--gpu-layers", "0" if dev == "cpu" else "-1", "--seeds", str(ORPHEUS_SEEDS)]
+            # llama-server first when it is installed; if it can't load, the in-process model still can.
+            for server in ([True, False] if server_ready() else [False]):
+                t_try = telemetry.now_ms()
+                proc = subprocess.Popen(args + (["--server", str(SERVER_EXE)] if server else []),
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        text=True, encoding="utf-8", bufsize=1, creationflags=_NO_WINDOW)
+                line = proc.stdout.readline()
+                try:
+                    msg = json.loads(line) if line else {"ready": False,
+                                                         "error": "o processo do Orpheus fechou ao carregar"}
+                except ValueError:
+                    msg = {"ready": False, "error": line.strip()[:200]}
+                tr.add_span("load.worker", t_try, backend="llama-server" if server else "llama-cpp-python",
+                            ready=bool(msg.get("ready")), error=msg.get("error"))
+                tr.extend(msg.get("events"), "worker")
+                if msg.get("ready"):
+                    break
                 self.proc = proc
                 self.stop()
                 self.state, self.error = "error", msg.get("error") or "falha ao carregar"
-                log.warning("Orpheus failed to load: %s", self.error)
+                log.warning("Orpheus failed to load%s: %s", " on llama-server" if server else "", self.error)
+                self.state = "loading"
+            else:
+                self.state = "error"
+                tr.finish(ok=False, error=self.error)
                 return
+            tr.finish(ok=True, backend=msg.get("backend"), gpu=msg.get("gpu"), slots=msg.get("slots"))
             self.proc, self.gpu, self.state = proc, bool(msg.get("gpu")), "ready"
+            self.uses_server = server
             threading.Thread(target=self._read, args=(proc,), daemon=True).start()
-            log.info("Orpheus ready (%s, gpu=%s).", dev, self.gpu)
+            log.info("Orpheus ready (%s, gpu=%s, %s).", dev, self.gpu,
+                     f"llama-server, {msg.get('slots')} lines at once" if server else "in-process")
             if dev != "cpu" and not self.gpu:
                 log.warning("Orpheus is running on the CPU: llama.cpp could not use the GPU.")
 
@@ -295,7 +405,13 @@ class Worker:
                 msg = json.loads(line)
             except ValueError:
                 continue
-            q = self.queues.get(msg.get("id"))
+            rid = msg.get("id")
+            if "events" in msg and rid in self.traces:  # the request's own timeline, even if nobody waits on it
+                trace, piece = self.traces.pop(rid)
+                trace.extend(msg["events"], "worker", piece=piece, rid=rid)
+                trace.mark("orpheus.result", piece=piece, rid=rid, seconds=msg.get("seconds"), took=msg.get("took"),
+                           tps=msg.get("tps"), cancelled=msg.get("cancelled"), error=msg.get("error"))
+            q = self.queues.get(rid)
             if q is not None:
                 q.put(msg)
         if self.proc is proc:  # died on its own
@@ -303,12 +419,16 @@ class Worker:
             for q in list(self.queues.values()):
                 q.put({"error": self.error})
 
-    def _send(self, msg: dict, raw: bool = False) -> int:
+    def _send(self, msg: dict, raw: bool = False, trace: tuple | None = None) -> int:
         with self.write_lock:
             if not raw:
                 self._n += 1
                 msg = {"id": self._n, **msg}
                 self.queues[self._n] = queue.Queue()
+                if trace and trace[0] is not telemetry.NULL:
+                    self.traces[self._n] = trace
+                    while len(self.traces) > 200:  # results that never came (worker restarted)
+                        self.traces.pop(next(iter(self.traces)))
             try:
                 self.proc.stdin.write(json.dumps(msg) + "\n")
                 self.proc.stdin.flush()
@@ -341,14 +461,14 @@ class Worker:
             except Exception:  # noqa: BLE001
                 p.kill()
 
-    def live(self, voice: str) -> Live:
+    def live(self, voice: str, trace=telemetry.NULL) -> Live:
         self.start()
         if self.state != "ready":
             raise RuntimeError(self.error or "Orpheus indisponível")
-        return Live(self, voice)
+        return Live(self, voice, trace)
 
-    def stream(self, text: str, voice: str, chunks: list[str] | None = None) -> Live:
-        st = self.live(voice)
+    def stream(self, text: str, voice: str, chunks: list[str] | None = None, trace=telemetry.NULL) -> Live:
+        st = self.live(voice, trace)
         for c in chunks or _chunks(text):
             st.add(c)
         st.finish()
@@ -493,6 +613,9 @@ class Install:
             {"id": "snac", "label": "Decodificador de áudio · SNAC", "detail": "transforma o modelo em som"},
             {"id": "test", "label": "Carregar e testar", "detail": "gera uma frase e mede o tempo"},
         ]
+        if support("orpheus")["device"] in LLAMA_SERVER:
+            items.insert(1, {"id": "server", "label": "Servidor · llama.cpp",
+                             "detail": "gera a voz direto na GPU, a próxima frase enquanto a atual toca"})
         for it in items:
             it.update(status="pending", bytes=0, total=None, error=None)
         with self.lock:
@@ -505,6 +628,11 @@ class Install:
         step = "env"
         try:
             self._env()
+            if support("orpheus")["device"] in LLAMA_SERVER and not server_ready():
+                step = "server"
+                self._set(step, status="running")
+                fetch_server(lambda got, total: self._set("server", bytes=got, total=total))
+                self._set(step, status="done")
             for step, (repo, f) in zip(("model", "snac"), ORPHEUS_FILES):
                 self._set(step, status="running")
                 tot = hf_fetch(repo, ORPHEUS_HF, [f], lambda got, total, s=step: self._set(s, bytes=got, total=total))

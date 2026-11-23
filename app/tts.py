@@ -6,7 +6,7 @@ import logging
 import re
 import threading
 
-from . import config
+from . import config, telemetry
 
 log = logging.getLogger("tts")
 SR = 24_000
@@ -22,12 +22,23 @@ class TTS:
             return
         if not config.KOKORO_MODEL.exists() or not config.KOKORO_VOICES.exists():
             raise RuntimeError("Kokoro model files missing. Run: uv run python scripts/download_models.py")
-        from kokoro_onnx import Kokoro
+        tr = telemetry.start("load", what="kokoro")
+        try:
+            with tr.span("load.kokoro_import"):
+                from kokoro_onnx import Kokoro
 
-        log.info("Loading Kokoro TTS...")
-        self._k = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
-        # The first synthesis is about twice as slow (graph and phonemizer warm-up): pay it now, not on the first line.
-        self._k.create("Hi.", voice="af_heart", speed=1.0, lang="en-us")
+            log.info("Loading Kokoro TTS...")
+            with tr.span("load.kokoro"):
+                k = Kokoro(str(config.KOKORO_MODEL), str(config.KOKORO_VOICES))
+            # The first synthesis is about twice as slow (graph and phonemizer warm-up): pay it now, not on the
+            # first line.
+            with tr.span("load.kokoro_warmup"):
+                k.create("Hi.", voice="af_heart", speed=1.0, lang="en-us")
+        except Exception as e:
+            tr.finish(ok=False, error=str(e)[:300])
+            raise
+        self._k = k
+        tr.finish(ok=True)
         log.info("Kokoro ready.")
 
     def _create(self, text: str, voice: str, speed: float):

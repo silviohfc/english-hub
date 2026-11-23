@@ -123,6 +123,16 @@ const isDev = () => (FLAGS?.track || "dev") !== "daily";
 let currentAudio = null;
 function stopAudio() { speakToken++; currentStream?.stop(); currentStream = null; if (currentAudio) { currentAudio.pause(); currentAudio = null; } }
 
+// ---- telemetry (app/telemetry.py) ----
+// The browser's side of each trace: events on the system clock (epoch ms), which the server and the voice worker
+// share, so the timelines line up. Sent once the turn or line is over.
+const nowMs = () => performance.timeOrigin + performance.now();
+function sendTelemetry(traceId, events, metrics = {}, attrs = {}) {
+  if (!traceId) return;
+  fetch(`/api/telemetry/${traceId}/client`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ events, metrics, attrs }) }).catch(() => {});
+}
+
 // Live audio level (0..1) from any audio node, like the speaking indicator of meeting apps.
 let actx = null;
 function audioCtx() {
@@ -196,11 +206,21 @@ class PcmPlayer {
     this.received = 0; this.end = 0; this.started = false; this.muted = false; this.si = 0; this.playing = -1; this.floor = 0.6;
     this.firstAudioAt = null;
     this.stats = { first_sound_s: null, gaps: 0, gap_max_s: 0, gap_total_s: 0, underruns: 0, played_s: 0 };
+    // Telemetry: every frame received and every block scheduled, on the epoch clock (see sendTelemetry).
+    // A block's `ts` is when it is heard (audio clock converted), not when it was scheduled.
+    this.tl = [];
+    this.waiting = -1;
+    this.firstSoundAt = null;
+    this.ev("player.open", { ctx_state: this.ctx.state, base_latency_ms: +((this.ctx.baseLatency || 0) * 1000).toFixed(1),
+      output_latency_ms: +((this.ctx.outputLatency || 0) * 1000).toFixed(1), prior_rtf: this.prior });
     this.tick = setInterval(() => this.pump(), 100);
   }
+  ev(name, o = {}) { if (this.tl.length < 20000) this.tl.push({ ts: +nowMs().toFixed(2), name, ...o }); }
+  epochOf(ctxTime) { return +(nowMs() + (ctxTime - this.ctx.currentTime) * 1000).toFixed(2); }
   get live() { return !this.muted && this.token === speakToken; }
   // Stop the sound (the learner interrupted); events keep being read if the stream continues.
   mute() {
+    if (!this.muted) this.ev("play.mute", { queued: this.queue.length, ahead_ms: +(this.ahead() * 1000).toFixed(1) });
     this.muted = true;
     this.queue = [];
     this.sources.forEach((x) => { try { x.stop(); } catch { /* ignore */ } });
@@ -234,14 +254,21 @@ class PcmPlayer {
     const now = this.ctx.currentTime;
     const at = Math.max(this.end, now + 0.04);
     if (!this.started) { this.started = true; this.onStart?.(); }
+    const playAt = this.epochOf(at);
     if (filler) {
       this.fillerUntil = at + buf.duration;
     } else if (this.stats.first_sound_s == null) {
       this.stats.first_sound_s = +((performance.now() - this.t0) / 1000 + (at - now)).toFixed(3);
+      this.firstSoundAt = playAt;
+      this.ev("play.first_sound", { ts: playAt, piece: this.playing });
     } else if (at - this.end > 0.06) {
       const gap = at - this.end; // the learner heard silence the text didn't ask for
       this.stats.gaps++; this.stats.gap_total_s += gap; this.stats.gap_max_s = Math.max(this.stats.gap_max_s, gap);
+      this.ev("play.gap", { ts: this.epochOf(this.end), dur: +(gap * 1000).toFixed(1), piece: this.playing });
     }
+    this.ev("play.block", { ts: playAt, dur: +(buf.duration * 1000).toFixed(1), piece: filler ? null : this.playing,
+      filler, scheduled_at: +nowMs().toFixed(2), lead_ms: +((at - now) * 1000).toFixed(1),
+      ahead_ms: +(Math.max(0, this.end - now) * 1000).toFixed(1) });
     src.start(at);
     this.end = at + buf.duration;
     if (!filler) this.stats.played_s += buf.duration;
@@ -254,8 +281,21 @@ class PcmPlayer {
       if (s !== this.playing || dry) {
         // A new piece (flows right on if it can play through, otherwise pauses at the boundary) or a refill after
         // running dry mid-piece (with a bigger margin): wait until it can play to its end.
-        if (dry && s === this.playing) { this.floor = 1.2; this.stats.underruns++; }
-        if (!this.ready(s)) return;
+        if (dry && s === this.playing) {
+          this.floor = 1.2; this.stats.underruns++;
+          this.ev("play.underrun", { piece: s, ts: this.epochOf(this.end) });
+        }
+        if (!this.ready(s)) {
+          if (this.waiting !== s) {
+            this.waiting = s;
+            const x = this.pieces[s];
+            this.ev("play.wait", { piece: s, rate: +this.rate().toFixed(3), floor: this.floor,
+              queued_ms: +(this.queue.filter((q) => q.s === s).reduce((a, q) => a + q.buf.duration, 0) * 1000).toFixed(1),
+              expected_ms: x ? +(x.exp * 1000).toFixed(0) : null, got_ms: x ? +(x.got * 1000).toFixed(0) : null });
+          }
+          return;
+        }
+        if (this.waiting === s) { this.waiting = -1; this.ev("play.go", { piece: s }); }
         this.playing = s;
       }
       this.queue.shift();
@@ -270,13 +310,23 @@ class PcmPlayer {
         const chars = (ev.text || "").length;
         this.pieces.push({ exp: Math.max(0.6, chars / 13) * 1.15, got: 0, done: false });
         this.si = this.pieces.length - 1;
+        this.ev("rx.piece", { piece: this.si, chars, text: ev.text });
+      } else if (ev.type !== "text") {
+        this.ev("rx." + ev.type, ev.type === "user" ? { chars: ev.user?.text?.length } : {});
+      } else if (!this.sawText) {
+        this.sawText = true;
+        this.ev("rx.first_text", { chars: (ev.text || "").length });
       }
       this.onEvent?.(ev);
     } else if (kind === 69) { // "E": piece finished
       if (this.pieces[this.si]) this.pieces[this.si].done = true;
+      this.ev("rx.piece_end", { piece: this.si });
     } else if (kind === 80 && len >= 2 && !this.muted) { // "P"
       if (!this.pieces.length) this.pieces.push({ exp: 3, got: 0, done: false }); // cached line: one piece
+      const t = nowMs();
       const buf = pcmBuffer(bytes, off, len);
+      this.ev("rx.pcm", { ts: +t.toFixed(2), piece: this.si, audio_ms: +(buf.duration * 1000).toFixed(1), bytes: len,
+        decode_ms: +(nowMs() - t).toFixed(2), ahead_ms: +(this.ahead() * 1000).toFixed(1) });
       if (this.firstAudioAt == null) this.firstAudioAt = performance.now();
       this.received += buf.duration;
       this.pieces[this.si].got += buf.duration;
@@ -303,19 +353,30 @@ class PcmPlayer {
         rest = bytes.slice(off);
         this.pump();
       }
+      this.ev("rx.done");
       this.pieces.forEach((x) => (x.done = true));
       this.pump();
       while (this.live && (this.queue.length || this.ctx.currentTime < this.end)) { this.pump(); await new Promise((r) => setTimeout(r, 80)); }
+      if (this.started) this.ev("play.done", { ts: this.epochOf(this.end) });
     } finally {
       this.close();
     }
   }
   close() {
+    if (!this.closed) { this.closed = true; this.ev("player.close", { muted: this.muted }); }
     clearInterval(this.tick);
     this.stopMeter?.(); this.stopMeter = null;
     this.stats.gap_total_s = +this.stats.gap_total_s.toFixed(3);
     this.stats.gap_max_s = +this.stats.gap_max_s.toFixed(3);
     this.stats.played_s = +this.stats.played_s.toFixed(2);
+  }
+  // Summary numbers for the trace, measured from `t0` (epoch ms: when the request went out).
+  metrics(t0) {
+    return { first_sound_ms: this.firstSoundAt && t0 ? +(this.firstSoundAt - t0).toFixed(1) : null,
+      gaps: this.stats.gaps, gap_total_ms: +(this.stats.gap_total_s * 1000).toFixed(1),
+      gap_max_ms: +(this.stats.gap_max_s * 1000).toFixed(1), underruns: this.stats.underruns,
+      played_s: this.stats.played_s, output_latency_ms: +((this.ctx.outputLatency || 0) * 1000).toFixed(1),
+      interrupted: this.muted };
   }
 }
 
@@ -326,9 +387,14 @@ async function streamSpeak(text, voice, token, onStart, cache, engine) {
   const player = new PcmPlayer({ token, onStart });
   const stream = { stop() { ctrl.abort(); player.mute(); } };
   currentStream = stream;
+  const t0 = nowMs();
+  let traceId = null;
   try {
+    player.ev("fetch.start", { chars: text.length });
     const res = await fetch("/api/tts/stream", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, voice, cache: !!cache, speed: settings.speed, engine: engine || "" }), signal: ctrl.signal });
+    traceId = res.headers.get("X-Trace");
+    player.ev("fetch.headers", { status: res.status, cached: res.headers.get("X-TTS-Cached") === "1" });
     if (!res.ok) throw new Error("stream unavailable");
     await player.consume(res);
   } catch (e) {
@@ -336,6 +402,7 @@ async function streamSpeak(text, voice, token, onStart, cache, engine) {
     if (e.name !== "AbortError" && !player.started && token === speakToken) throw e;
   } finally {
     player.close();
+    sendTelemetry(traceId, player.tl, player.metrics(t0));
     if (currentStream === stream) currentStream = null;
   }
 }
@@ -429,13 +496,17 @@ const blobName = (blob) => (blob?.type.includes("mp4") ? "speech.m4a" : "speech.
 class Recorder {
   async start() {
     stopAudio();
+    const t0 = nowMs();
+    this.tl = []; // telemetry: how long the microphone took to open, when speech started and stopped
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    this.tl.push({ ts: t0, dur: +(nowMs() - t0).toFixed(1), name: "rec.mic_open" });
     this.chunks = [];
     const mimeType = recMime();
     this.rec = new MediaRecorder(this.stream, mimeType ? { mimeType } : undefined);
     this.rec.ondataavailable = (e) => e.data.size && this.chunks.push(e.data);
     this.rec.start();
     this.startedAt = Date.now();
+    this.tl.push({ ts: nowMs(), name: "rec.start", mime: this.rec.mimeType });
     if (this.onLevel) {
       try { this.stopMeter = meter(audioCtx().createMediaStreamSource(this.stream), this.onLevel); } catch { /* optional */ }
     }
@@ -444,10 +515,14 @@ class Recorder {
   stop() {
     return new Promise((resolve) => {
       if (!this.active) return resolve(null);
+      const t0 = nowMs();
+      this.tl?.push({ ts: t0, name: "rec.stop", spoken_ms: Date.now() - this.startedAt });
       this.rec.onstop = () => {
         this.stopMeter?.(); this.stopMeter = null;
         this.stream.getTracks().forEach((t) => t.stop());
-        resolve(new Blob(this.chunks, { type: (this.rec.mimeType || "audio/webm").split(";")[0] }));
+        const blob = new Blob(this.chunks, { type: (this.rec.mimeType || "audio/webm").split(";")[0] });
+        this.tl?.push({ ts: t0, dur: +(nowMs() - t0).toFixed(1), name: "rec.finalize", bytes: blob.size });
+        resolve(blob);
       };
       this.rec.stop();
     });
@@ -505,7 +580,7 @@ const NAV = [["home", "Praticar", "mic"], ["phrases", "Minhas frases", "star"], 
   ["notebook", "Caderno de erros", "list"], ["profile", "Perfil", "user"]];
 $("#nav").innerHTML = NAV.map(([id, label, icon]) => `<a href="#${id}" data-nav="${id}">${ic(icon)}<span>${label}</span></a>`).join("");
 $("#settings-link").innerHTML = ic("settings");
-const NAV_OWNER = { settings: "settings", uninstall: "settings", home: "home", jobs: "home", situations: "home", classics: "home", brief: "home", chat: "home", call: "home", report: "history",
+const NAV_OWNER = { settings: "settings", uninstall: "settings", telemetry: "settings", home: "home", jobs: "home", situations: "home", classics: "home", brief: "home", chat: "home", call: "home", report: "history",
   retell: "history", phrases: "phrases", train: "phrases", history: "history", notebook: "notebook", profile: "profile" };
 
 async function pollStatus() {
@@ -571,7 +646,7 @@ async function route() {
   const pages = { home: renderHome, jobs: renderJobs, situations: renderSituations, classics: renderClassics, brief: renderBrief,
     chat: renderChat, call: renderChat, report: renderReport, retell: renderRetell, phrases: renderPhrases, train: renderTrain,
     history: renderHistory, notebook: renderNotebook, profile: renderProfile,
-    setup: renderSetup, onboard: renderOnboard, settings: renderSettings, uninstall: renderUninstall };
+    setup: renderSetup, onboard: renderOnboard, settings: renderSettings, uninstall: renderUninstall, telemetry: renderTelemetry };
   try {
     await (pages[name] || renderHome)(arg, arg2);
     clearTimeout(slow);
@@ -1020,7 +1095,7 @@ async function callTurn(c, { blob = null, start = false } = {}) {
       if (withVoice && settings.fillers && c.fillers.length && !c.fillerLast) {
         fillerTimer = setTimeout(() => {
           const buf = c.fillers[Math.floor(Math.random() * c.fillers.length)];
-          if (mine() && player.prepend(buf)) c.fillerLast = true;
+          if (mine() && player.prepend(buf)) { c.fillerLast = true; player.ev("filler.played", { dur: +(buf.duration * 1000).toFixed(1) }); }
         }, FILLER_AFTER_MS);
       }
     } else if (ev.type === "text") {
@@ -1041,13 +1116,21 @@ async function callTurn(c, { blob = null, start = false } = {}) {
   // The learner started talking over the partner: silence the voice, keep the text coming.
   let turnNo = null; // the server's id for this turn, so a late "hush" can never silence the next one
   const stream = { stop() {
+    player.ev("turn.hush", { sent: !!turnNo });
     player.mute();
     if (turnNo) fetch(`/api/session/${sid}/hush?turn=${turnNo}`, { method: "POST" }).catch(() => {});
   } };
   currentStream = stream;
+  const recTl = blob && c.rec?.tl ? [...c.rec.tl] : [];
+  const recStop = recTl.find((e) => e.name === "rec.stop")?.ts;
+  const t0 = nowMs();
+  let traceId = null;
+  player.ev("fetch.start", { bytes: blob?.size || 0, opening: start, with_voice: withVoice, engine: VOICE_ENGINE });
   try {
     const res = await fetch(`/api/session/${sid}/turn/stream`, { method: "POST", body: fd });
     turnNo = res.headers.get("X-Turn");
+    traceId = res.headers.get("X-Trace");
+    player.ev("fetch.headers", { status: res.status, turn: turnNo });
     if (player.muted && turnNo) stream.stop(); // interrupted before the answer started
     if (!res.ok) {
       let msg = res.statusText;
@@ -1062,6 +1145,13 @@ async function callTurn(c, { blob = null, start = false } = {}) {
     clearTimeout(fillerTimer);
     player.close();
     if (currentStream === stream) currentStream = null;
+    if (failed) player.ev("turn.failed", { message: String(failed).slice(0, 300) });
+    // From the end of the learner's speech (what the learner feels), and from the request.
+    const pm = player.metrics(t0);
+    sendTelemetry(traceId, [...recTl, ...player.tl], { ...pm,
+      first_sound_after_speech_ms: player.firstSoundAt && recStop ? +(player.firstSoundAt - recStop).toFixed(1) : null,
+      upload_bytes: blob?.size || 0, failed: failed || null },
+    { scenario: c.scenario.id, engine_client: VOICE_ENGINE, with_voice: withVoice });
   }
   c.fillerLast = player.fillerUntil != null; // this turn used a "hmm": the next one won't
   if (!mine()) return;
@@ -2375,7 +2465,191 @@ async function voiceMetrics(root) {
       ${s.rtf != null ? metricRow("Tempo de geração por segundo de fala", s.rtf.toFixed(2).replace(".", ",") + "×") : ""}
     </div>
     <p class="hint-line">Última fala: voz ${esc(last.engine || "–")}, ${last.streaming ? "com streaming (Claude)" : "sem streaming"}.
-      ${s.rtf != null && s.rtf > 1 ? "A voz é gerada mais devagar que o tempo real neste computador: pausas entre frases são esperadas. A voz neutra (Kokoro) não tem esse problema." : ""}</p></div>`;
+      ${s.rtf != null && s.rtf > 1 ? "A voz é gerada mais devagar que o tempo real neste computador: pausas entre frases são esperadas. A voz neutra (Kokoro) não tem esse problema." : ""}</p>
+    <a class="btn" href="#telemetry">${ic("history")} Ver a linha do tempo de cada fala</a></div>`;
+}
+
+// =====================================================================
+// telemetry: every call, line and load as a timeline (app/telemetry.py)
+// =====================================================================
+const TL_KINDS = [["", "Tudo"], ["turn", "Turnos da ligação"], ["tts", "Falas avulsas"], ["llm", "IA"],
+  ["transcribe", "Transcrições"], ["load", "Carregamentos"]];
+const TL_KIND_LABEL = { turn: "Turno", tts: "Fala", llm: "IA", transcribe: "Transcrição", load: "Carregamento" };
+const msTxt = (ms) => (ms == null || Number.isNaN(ms) ? "–" : ms >= 1000 ? (ms / 1000).toFixed(2).replace(".", ",") + " s" : Math.round(ms) + " ms");
+const clock = (ts) => new Date(ts).toLocaleTimeString("pt-BR", { hour12: false }) + "," + String(Math.floor(ts % 1000)).padStart(3, "0");
+
+function traceTitle(t) {
+  const a = t.attrs || {};
+  if (t.kind === "turn") return `${a.persona || "Ligação"} · turno ${a.turn ?? ""}${a.opening ? " (abertura)" : ""}`;
+  if (t.kind === "tts") return `“${String(a.text || "").slice(0, 60)}${String(a.text || "").length > 60 ? "…" : ""}”`;
+  if (t.kind === "llm") return `${a.role || "chamada"} · ${a.provider || ""} ${a.model || ""}`;
+  if (t.kind === "load") return `Carregar ${a.what || ""}`;
+  if (t.kind === "transcribe") return `Transcrição (${a.language || ""})`;
+  return t.kind;
+}
+function traceKeyNumbers(t) {
+  const m = t.metrics || {}, dur = t.end ? t.end - t.start : null;
+  const out = [];
+  if (t.kind === "turn") {
+    if (m.first_sound_after_speech_ms != null) out.push(["voz após você parar", m.first_sound_after_speech_ms]);
+    else if (m.first_sound_ms != null) out.push(["1ª voz", m.first_sound_ms]);
+    if (m.stt_ms != null) out.push(["Whisper", m.stt_ms]);
+    if (m.llm_first_ms != null) out.push(["IA 1º texto", m.llm_first_ms]);
+    if (m.gaps != null) out.push(["pausas", null, m.gaps ? `${m.gaps} (${msTxt(m.gap_total_ms)})` : "0"]);
+  } else if (t.kind === "tts") {
+    if (m.first_sound_ms != null) out.push(["1ª voz", m.first_sound_ms]);
+    if (m.gaps != null) out.push(["pausas", null, String(m.gaps)]);
+    out.push(["total", dur]);
+  } else out.push(["duração", dur]);
+  if (m.error || m.failed) out.push(["erro", null, String(m.error || m.failed).slice(0, 40)]);
+  return out;
+}
+
+async function renderTelemetry(arg = "") {
+  if (arg && arg !== "list") return renderTrace(arg);
+  let kind = store.get("tl-kind", "");
+  view.innerHTML = pageHead("Telemetria", "Cada turno da ligação, fala, chamada da IA e carregamento, com o tempo de cada etapa. Fica só no seu computador.", ["#settings", "Configurações"])
+    + `<div class="stack"><div class="row tl-toolbar"><div class="seg" id="tl-kinds" role="group" aria-label="Tipo">${TL_KINDS.map(([k, l]) =>
+      `<button type="button" data-k="${k}">${l}</button>`).join("")}</div><span class="grow"></span>
+      <a class="btn" id="tl-day" download>${ic("download")} Baixar o dia (NDJSON)</a></div>
+      <div id="tl-list" class="rows"></div><p class="hint-line" id="tl-where"></p></div>`;
+  const paint = async () => {
+    $$("#tl-kinds [data-k]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.k === kind)));
+    const r = await api(`/api/telemetry?limit=300&kind=${kind}`).catch((e) => ({ traces: [], error: e.message }));
+    $("#tl-where").textContent = r.enabled === false ? "A telemetria está desligada (ENGLISH_HUB_TELEMETRY=0)."
+      : r.dir ? `Arquivos: ${r.dir} — um JSON por trace, mais requests.jsonl com o tempo de cada chamada da API.` : "";
+    const day = new Date().toLocaleDateString("sv-SE");
+    $("#tl-day").href = `/api/telemetry/day/${day}`;
+    if (!r.traces.length) { $("#tl-list").innerHTML = `<p class="hint-line" style="padding:18px 8px">${r.error ? esc(r.error) : "Nada registrado ainda. Faça uma ligação ou ouça uma frase."}</p>`; return; }
+    $("#tl-list").innerHTML = r.traces.map((t) => `<a class="row-item tl-row" href="#telemetry/${t.id}">
+      <span class="tl-time">${esc(new Date(t.start).toLocaleString("pt-BR", { hour12: false, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }))}</span>
+      <span class="pill ${t.kind === "turn" ? "sub" : ""}">${esc(TL_KIND_LABEL[t.kind] || t.kind)}</span>
+      <span class="body"><span class="t">${esc(traceTitle(t))}</span></span>
+      <span class="tl-nums">${traceKeyNumbers(t).map(([l, v, txt]) => `<span><span class="muted">${esc(l)}</span> <b>${esc(txt ?? msTxt(v))}</b></span>`).join("")}</span>
+      ${ic("chevron", "chev")}</a>`).join("");
+  };
+  $$("#tl-kinds [data-k]").forEach((b) => (b.onclick = () => { kind = b.dataset.k; store.set("tl-kind", kind); paint(); }));
+  await paint();
+}
+
+// Lanes of the timeline: which row an event goes to.
+function tlLane(e) {
+  const n = e.name, piece = e.piece;
+  if (e.src === "gpu") return ["gpu", "GPU", 90];
+  if (n.startsWith("rec.")) return ["rec", "Você (microfone)", 0];
+  if (n.startsWith("load.")) return ["load", "Carregamento", 5];
+  if (n.startsWith("fetch.") || n.startsWith("http.") || n === "turn.hush" || n === "turn.failed") return ["net", "Requisição", 10];
+  if (n.startsWith("stt.") || n === "turn.stt" || n === "turn.heard") return ["stt", "Whisper (ouvir)", 20];
+  if (n.startsWith("llm.")) return ["llm", "IA (texto)", 30];
+  if (n.startsWith("speech.piece_in") || n === "speech.text_done" || n === "turn.reply") return ["cut", "Trechos de texto", 40];
+  if (n === "kokoro.synth") return [`gen${piece}`, `Kokoro · trecho ${piece + 1}`, 50 + piece];
+  if (e.src === "worker" || n.startsWith("orpheus.request") || n.startsWith("orpheus.result"))
+    return piece != null ? [`gen${piece}`, `Orpheus · trecho ${piece + 1}`, 50 + piece] : ["load", "Carregamento", 5];
+  if (n.startsWith("speech.") || n === "orpheus.chunk" || n.startsWith("voice.")) return ["out", "Áudio pronto (servidor)", 70];
+  if (n === "rx.pcm" || n.startsWith("rx.")) return ["rx", "Recebido (navegador)", 75];
+  if (n.startsWith("play.") || n.startsWith("filler") || n.startsWith("player.")) return ["play", "Tocando (o que você ouve)", 80];
+  if (n.startsWith("db.") || n.startsWith("turn.") || n.startsWith("trace.")) return ["app", "App", 8];
+  return ["other", "Outros", 95];
+}
+// Spans between two marks, so waits and phases show as bars: [from, to, label, class, lane-from-event]
+const TL_PAIRS = [
+  ["rec.start", "rec.stop", "falando", "k-you"],
+  ["fetch.start", "fetch.headers", "até a resposta começar", "k-wait"],
+  ["llm.sent", "llm.message_start", "esperando a API", "k-wait"],
+  ["llm.message_start", "llm.first_text", "até o 1º texto", "k-wait"],
+  ["llm.first_text", "llm.result", "escrevendo", "k-text"],
+  ["worker.received", "worker.start", "fila do worker", "k-wait"],
+  ["gen.request", "gen.first_audio_token", "prompt", "k-work"],
+  ["gen.first_audio_token", "voice.onset", "silêncio inicial", "k-silence"],
+  ["voice.onset", "gen.end", "gerando voz", "k-voice"],
+  ["play.wait", "play.go", "esperando buffer", "k-wait"],
+];
+const TL_CLASS = { "turn.stt": "k-work", "stt.transcribe": "k-work", "stt.decode": "k-work", "stt.segment": "k-work",
+  "stt.lock_wait": "k-wait", "stt.load_wait": "k-wait", "turn.order_wait": "k-wait", "llm.lock_wait": "k-wait", "llm.call": "k-text",
+  "kokoro.synth": "k-voice", block: "k-block", "play.block": "k-play", "play.gap": "k-gap", "rec.mic_open": "k-wait",
+  "rec.finalize": "k-work", "voice.engine_for": "k-work", "db.add_turn": "k-work", "tts.synth": "k-voice" };
+const TL_IMPORTANT = new Set(["play.first_sound", "llm.first_text", "voice.onset", "speech.first_audio", "play.underrun",
+  "turn.hush", "llm.error", "worker.error", "turn.failed", "http.client_disconnected", "speech.closed"]);
+
+async function renderTrace(id) {
+  const t = await api(`/api/telemetry/${id}`).catch(() => null);
+  if (!t) { view.innerHTML = pageHead("Telemetria", "Esse registro não existe mais.", ["#telemetry", "Telemetria"]); return; }
+  const evs = t.events || [];
+  const t0 = Math.min(t.start, ...evs.map((e) => e.ts));
+  const t1 = Math.max(t.end || t.start, ...evs.map((e) => e.ts + (e.dur || 0)));
+  const span = Math.max(1, t1 - t0);
+  // lanes
+  const lanes = new Map();
+  const lane = (key, label, order) => { if (!lanes.has(key)) lanes.set(key, { key, label, order, items: [] }); return lanes.get(key); };
+  const gpu = [];
+  for (const e of evs) {
+    if (e.src === "gpu") { gpu.push(e); continue; }
+    const [k, l, o] = tlLane(e);
+    lane(k, l, o).items.push(e);
+  }
+  // derived spans (per piece for the worker's phases)
+  for (const [a, b, label, cls] of TL_PAIRS) {
+    const starts = evs.filter((e) => e.name === a);
+    for (const s of starts) {
+      const end = evs.find((e) => e.name === b && e.ts >= s.ts && (s.piece == null || e.piece === s.piece));
+      if (!end) continue;
+      const [k, l, o] = tlLane(s);
+      lane(k, l, o).items.push({ ts: s.ts, dur: end.ts - s.ts, name: label, derived: true, cls, piece: s.piece, src: s.src });
+    }
+  }
+  const sorted = [...lanes.values()].sort((x, y) => x.order - y.order);
+  const m = t.metrics || {}, a = t.attrs || {};
+  const pct = (ts) => ((ts - t0) / span) * 100;
+  const tip = (e) => esc(`${e.name}${e.dur != null ? ` · ${msTxt(e.dur)}` : ""} @ +${msTxt(e.ts - t0)}\n` +
+    Object.entries(e).filter(([k]) => !["ts", "dur", "name", "derived", "cls"].includes(k)).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`).join("\n"));
+  const item = (e) => {
+    const cls = e.cls || TL_CLASS[e.name] || (e.dur != null ? "k-work" : "");
+    if (e.dur != null && e.dur > 0) {
+      return `<div class="tl-bar ${cls}" style="left:${pct(e.ts)}%;width:max(2px,${(e.dur / span) * 100}%)" title="${tip(e)}">${e.derived || e.name === "play.gap" ? `<span>${esc(e.name)}</span>` : ""}</div>`;
+    }
+    return `<div class="tl-mark ${TL_IMPORTANT.has(e.name) ? "imp" : ""} ${e.name.includes("error") || e.name === "play.underrun" ? "bad" : ""}" style="left:${pct(e.ts)}%" title="${tip(e)}">${TL_IMPORTANT.has(e.name) ? `<span>${esc(e.name)}</span>` : ""}</div>`;
+  };
+  const gpuSvg = gpu.length ? `<svg class="tl-gpu" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-label="Uso da GPU">
+    <polyline points="${gpu.map((g) => `${(pct(g.ts) * 10).toFixed(1)},${100 - (g.util ?? 0)}`).join(" ")}" class="util"/>
+    <polyline points="${gpu.map((g) => `${(pct(g.ts) * 10).toFixed(1)},${100 - (g.mem_total_mb ? (g.mem_mb / g.mem_total_mb) * 100 : 0)}`).join(" ")}" class="mem"/></svg>` : "";
+  // axis
+  const step = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 60000].find((s) => span / s <= 12) || 60000;
+  const ticks = []; for (let x = 0; x <= span; x += step) ticks.push(x);
+  const gpuMax = gpu.length ? Math.max(...gpu.map((g) => g.util ?? 0)) : null;
+  const gpuMem = gpu.length ? Math.max(...gpu.map((g) => g.mem_mb ?? 0)) : null;
+  const metricItems = Object.entries(m).filter(([, v]) => v != null && v !== "");
+  view.innerHTML = pageHead(traceTitle(t), `${TL_KIND_LABEL[t.kind] || t.kind} · ${new Date(t.start).toLocaleString("pt-BR", { hour12: false })} · ${msTxt(span)} do primeiro ao último evento · ${evs.length} eventos`, ["#telemetry", "Telemetria"])
+    + `<div class="stack">
+      <div class="panel"><div class="metrics-row">${metricItems.map(([k, v]) => metricRow(k, typeof v === "number" && /_ms$/.test(k) ? msTxt(v) : String(v))).join("")}
+        ${gpuMax != null ? metricRow("GPU (pico)", `${gpuMax}% · ${Math.round(gpuMem)} MB`) : ""}</div>
+        <div class="row" style="margin-top:10px;gap:6px">${Object.entries(a).filter(([, v]) => v != null && v !== "" && String(v).length < 80).map(([k, v]) => `<span class="pill">${esc(k)}: ${esc(v)}</span>`).join("")}</div></div>
+      <div class="row tl-toolbar"><span class="muted">Zoom</span><div class="seg" id="tl-zoom">${[1, 2, 4, 8, 16].map((z) => `<button type="button" data-z="${z}">${z}×</button>`).join("")}</div>
+        <span class="grow"></span><span class="tl-legend"><i class="k-wait"></i>espera <i class="k-work"></i>processando <i class="k-text"></i>texto da IA <i class="k-silence"></i>silêncio inicial <i class="k-voice"></i>gerando voz <i class="k-play"></i>tocando <i class="k-gap"></i>pausa não pedida</span>
+        <a class="btn" href="/api/telemetry/${t.id}" download="trace-${t.id}.json">${ic("download")} JSON</a></div>
+      <div class="tl" id="tl"><div class="tl-inner" id="tl-inner">
+        <div class="tl-lane tl-axis"><div class="tl-label"></div><div class="tl-track">${ticks.map((x) => `<span style="left:${(x / span) * 100}%">${msTxt(x)}</span>`).join("")}</div></div>
+        ${sorted.map((l) => `<div class="tl-lane"><div class="tl-label">${esc(l.label)}</div><div class="tl-track">${l.items.map(item).join("")}</div></div>`).join("")}
+        ${gpu.length ? `<div class="tl-lane tl-lane-gpu"><div class="tl-label">GPU <span class="muted">uso · memória</span></div><div class="tl-track">${gpuSvg}</div></div>` : ""}
+      </div></div>
+      <div class="row tl-toolbar"><b>Eventos</b><span class="grow"></span><input id="tl-filter" class="input" placeholder="Filtrar (nome, origem, texto)" style="max-width:320px"></div>
+      <div class="tl-table-wrap"><table class="tl-table"><thead><tr><th>+tempo</th><th>hora</th><th>origem</th><th>evento</th><th>duração</th><th>detalhes</th></tr></thead>
+        <tbody id="tl-rows"></tbody></table></div></div>`;
+  const rows = evs.map((e) => {
+    const extra = Object.entries(e).filter(([k]) => !["ts", "dur", "name", "src"].includes(k)).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join("  ");
+    return { text: `${e.src} ${e.name} ${extra}`.toLowerCase(),
+      html: `<tr><td class="num">+${msTxt(e.ts - t0)}</td><td class="num">${clock(e.ts)}</td><td>${esc(e.src)}</td><td><b>${esc(e.name)}</b></td><td class="num">${e.dur != null ? msTxt(e.dur) : ""}</td><td class="tl-extra">${esc(extra)}</td></tr>` };
+  });
+  const paintRows = () => {
+    const q = $("#tl-filter").value.trim().toLowerCase();
+    const shown = (q ? rows.filter((r) => r.text.includes(q)) : rows).filter((r) => !r.text.startsWith("gpu ") || q);
+    $("#tl-rows").innerHTML = shown.slice(0, 3000).map((r) => r.html).join("");
+  };
+  $("#tl-filter").oninput = paintRows;
+  paintRows();
+  let zoom = 1;
+  const setZoom = (z) => { zoom = z; $("#tl-inner").style.width = `${z * 100}%`; $$("#tl-zoom [data-z]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.z === z))); };
+  $$("#tl-zoom [data-z]").forEach((b) => (b.onclick = () => setZoom(+b.dataset.z)));
+  setZoom(span > 8000 ? 2 : 1);
 }
 
 // =====================================================================

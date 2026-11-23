@@ -21,6 +21,8 @@ from typing import Iterable, Iterator
 
 import numpy as np
 
+from . import telemetry
+
 log = logging.getLogger("speech")
 
 SR = 24_000
@@ -138,6 +140,7 @@ class Trimmer:
 
     def __init__(self) -> None:
         self.started, self.held = False, np.zeros(0, dtype=np.int16)
+        self.cut_lead = self.cut_tail = 0  # samples of silence removed at each edge (telemetry)
 
     @staticmethod
     def _first_voiced(x: np.ndarray) -> int | None:
@@ -162,9 +165,12 @@ class Trimmer:
         if not self.started:
             i = self._first_voiced(x)
             if i is None:
-                self.held = x[-int(LEAD_PAD * SR):]  # keep only what could become the lead pad
+                keep = x[-int(LEAD_PAD * SR):]  # keep only what could become the lead pad
+                self.cut_lead += len(x) - len(keep)
+                self.held = keep
                 return b""
             self.started = True
+            self.cut_lead += max(0, i - int(LEAD_PAD * SR))
             x = x[max(0, i - int(LEAD_PAD * SR)):]
         # Hold back the trailing silent run (it may be the piece's end) plus a little voiced audio; a pause longer
         # than MAX_HOLD is part of the speech and goes through.
@@ -181,6 +187,7 @@ class Trimmer:
         if not self.started or not len(x):
             return b""
         stop = min(len(x), self._last_voiced(x) + int(TAIL_PAD * SR))
+        self.cut_tail += len(x) - stop
         return x[:stop].tobytes()
 
 
@@ -192,21 +199,25 @@ class Speech:
     Iterate for events: ("piece", text) before a piece's audio, ("pcm", bytes), ("end", index) after it.
     `close()` stops generating (safe from any thread); `stats` has the timings."""
 
-    def __init__(self, engine: str, voice: str, speed: float = 1.0) -> None:
-        self.engine, self.voice, self.speed = engine, voice, speed
+    def __init__(self, engine: str, voice: str, speed: float = 1.0, trace=telemetry.NULL) -> None:
+        self.engine, self.voice, self.speed, self.trace = engine, voice, speed, trace
         self.pieces: "queue.Queue[str | None]" = queue.Queue()
         self.closed = threading.Event()
         self.cancelled = False
         self.stats = {"engine": engine, "pieces": 0, "audio_s": 0.0, "gen_s": 0.0, "first_audio_s": None}
         self._t0 = time.time()
         self._orpheus = None
+        self._added = 0
 
     # producer side
     def add(self, piece: str) -> None:
         if piece.strip():
+            self.trace.mark("speech.piece_in", index=self._added, chars=len(piece), text=piece)
+            self._added += 1
             self.pieces.put(piece)
 
     def finish(self) -> None:
+        self.trace.mark("speech.text_done", pieces=self._added)
         self.pieces.put(None)
 
     def close(self) -> None:
@@ -233,11 +244,14 @@ class Speech:
             yield cur, pause_after(prev) if prev is not None else 0.0
             prev = cur
 
-    def _emit(self, pcm: bytes):
+    def _emit(self, pcm: bytes, piece: int = -1, lead: float = 0.0):
         if pcm:
             if self.stats["first_audio_s"] is None:
                 self.stats["first_audio_s"] = round(time.time() - self._t0, 3)
+                self.trace.mark("speech.first_audio", piece=piece)
             self.stats["audio_s"] += len(pcm) / 2 / SR
+            self.trace.mark("speech.out", piece=piece, audio_ms=round(len(pcm) / 2 / SR * 1000, 1),
+                            lead_ms=round(lead * 1000) or None)
             yield "pcm", pcm
 
     def __iter__(self):
@@ -246,9 +260,12 @@ class Speech:
             for ev in gen:
                 if self.closed.is_set():
                     self.cancelled = True
+                    self.trace.mark("speech.closed")
                     return
                 yield ev
         finally:
+            self.trace.mark("speech.end", cancelled=self.cancelled, audio_s=round(self.stats["audio_s"], 2),
+                            pieces=self.stats["pieces"])
             self.stats["audio_s"] = round(self.stats["audio_s"], 2)
             self.stats["gen_s"] = round(self.stats["gen_s"], 2)
             if self._orpheus is not None:
@@ -261,17 +278,23 @@ class Speech:
         for i, (piece, lead) in enumerate(self._pieces()):
             yield "piece", clean(piece)
             t = time.time()
-            samples = tts.synth_pcm(clean(piece), self.voice, self.speed)
+            with self.trace.span("kokoro.synth", piece=i, chars=len(piece)) as sp:
+                samples = tts.synth_pcm(clean(piece), self.voice, self.speed)
+                sp["audio_ms"] = round(len(samples) / 2 / SR * 1000, 1)
             self.stats["gen_s"] += time.time() - t
             self.stats["pieces"] += 1
             tr = Trimmer()
-            yield from self._emit(silence(lead) + tr.push(samples) + tr.end())
+            out = tr.push(samples) + tr.end()
+            self.trace.mark("speech.trim", piece=i, lead_cut_ms=round(tr.cut_lead / SR * 1000, 1),
+                            tail_cut_ms=round(tr.cut_tail / SR * 1000, 1))
+            yield from self._emit(silence(lead) + out, i, lead)
+            self.trace.mark("speech.piece_end", piece=i)
             yield "end", i
 
     def _orpheus_events(self):
         from . import voices
 
-        live = voices.worker.live(voices.ORPHEUS_VOICE.get(self.voice, "tara"))
+        live = voices.worker.live(voices.ORPHEUS_VOICE.get(self.voice, "tara"), self.trace)
         self._orpheus = live
         if self.closed.is_set():
             live.close()
@@ -291,19 +314,27 @@ class Speech:
         tr, i, fresh = Trimmer(), 0, True
         for kind, data in live:
             if kind == "pcm":
+                self.trace.mark("orpheus.chunk", piece=i, audio_ms=round(len(data) / 2 / SR * 1000, 1))
                 out = tr.push(data)
+                lead = 0.0
                 if out and fresh:
                     yield "piece", texts[i] if i < len(texts) else ""
-                    out, fresh = silence(leads[i] if i < len(leads) else 0.0) + out, False
-                yield from self._emit(out)
+                    lead = leads[i] if i < len(leads) else 0.0
+                    out, fresh = silence(lead) + out, False
+                yield from self._emit(out, i, lead)
             else:  # piece `data` finished
                 tail = tr.end()
+                lead = 0.0
                 if fresh:
                     yield "piece", texts[i] if i < len(texts) else ""
                     if tail:
-                        tail = silence(leads[i] if i < len(leads) else 0.0) + tail
+                        lead = leads[i] if i < len(leads) else 0.0
+                        tail = silence(lead) + tail
                 self.stats["pieces"] += 1
-                yield from self._emit(tail)
+                self.trace.mark("speech.trim", piece=i, lead_cut_ms=round(tr.cut_lead / SR * 1000, 1),
+                                tail_cut_ms=round(tr.cut_tail / SR * 1000, 1))
+                yield from self._emit(tail, i, lead)
+                self.trace.mark("speech.piece_end", piece=i)
                 yield "end", data
                 tr, i, fresh = Trimmer(), data + 1, True
         self.stats["gen_s"] = time.time() - t
@@ -324,9 +355,9 @@ def engine_for(requested: str | None = None) -> str:
     return engine
 
 
-def speak(text: str, engine: str, voice: str, speed: float = 1.0) -> Speech:
+def speak(text: str, engine: str, voice: str, speed: float = 1.0, trace=telemetry.NULL) -> Speech:
     """A whole line, cut by the engine's policy."""
-    sp = Speech(engine, voice, speed)
+    sp = Speech(engine, voice, speed, trace)
     for piece in split(text, engine):
         sp.add(piece)
     sp.finish()

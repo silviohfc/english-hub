@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import config, db, providers, voices
+from . import config, db, providers, telemetry, voices
 
 log = logging.getLogger("uninstall")
 WIN = sys.platform == "win32"
@@ -63,6 +63,10 @@ def items() -> list[dict]:
     out.append({"id": "data:db", "group": "data", "label": "Histórico, frases e perfil",
                 "detail": "conversas, frases (e o áudio delas), caderno de erros, perfil e cenários salvos",
                 "bytes": _size(config.DB_PATH) if config.DB_PATH.exists() else 0, "all": True})
+    if telemetry.DIR.exists():
+        out.append({"id": "data:telemetry", "group": "data", "label": "Telemetria",
+                    "detail": "linha do tempo de cada fala e chamada (data/telemetry)", "bytes": _size(telemetry.DIR),
+                    "all": True})
     out.append({"id": "data:settings", "group": "data", "label": "Configurações",
                 "detail": "qualidade, modelos e provedores escolhidos (voltam ao padrão)",
                 "bytes": _size(config.SETTINGS_PATH) if config.SETTINGS_PATH.exists() else 0, "all": True})
@@ -128,6 +132,9 @@ def run(ids: list[str]) -> dict:
                 db.wipe()
                 shutil.rmtree(voices.CACHE_DIR, ignore_errors=True)
                 reset_onboarding = True
+            elif item_id == "data:telemetry":
+                telemetry.RECENT.clear()
+                shutil.rmtree(telemetry.DIR, ignore_errors=True)
             elif item_id == "data:settings":
                 config.SETTINGS_PATH.unlink(missing_ok=True)
             elif item_id == "env:venv":

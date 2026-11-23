@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, llm, metrics, prompts, providers, speech, uninstall, voices
+from . import config, db, llm, metrics, prompts, providers, speech, telemetry, uninstall, voices
 from . import setup as setup_mod
 from .stt import stt
 from .tts import tts
@@ -28,8 +28,13 @@ app = FastAPI(title="english-hub")
 
 @app.middleware("http")
 async def _no_stale_ui(request, call_next):
-    """The UI changes with every update: make the browser revalidate it instead of using a cached copy."""
+    """The UI changes with every update: make the browser revalidate it instead of using a cached copy.
+    Every API request is also timed for telemetry (data/telemetry/<day>/requests.jsonl)."""
+    t0 = telemetry.now_ms()
     response = await call_next(request)
+    if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/telemetry"):
+        telemetry.request_log(request.method, request.url.path, response.status_code, t0,
+                              response.headers.get("X-Trace"))
     if request.url.path == "/" or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
@@ -86,6 +91,7 @@ def _warmup() -> None:
         except Exception as e:  # noqa: BLE001
             log.warning("prewarm failed: %s", e)
     threading.Thread(target=prewarm, daemon=True).start()
+    threading.Thread(target=telemetry.prune, daemon=True).start()
 
     if not config.current()["setup_done"]:
         return
@@ -96,6 +102,7 @@ def _warmup() -> None:
 
     if voices.active() == "orpheus":
         voices.worker.warm()
+    voices.upgrade_server()
 
     def load():
         for name, fn in (("stt", stt.load), ("tts", tts.load)):
@@ -111,6 +118,7 @@ def _shutdown() -> None:
     for live in LIVE.values():
         live["chat"].close()
     voices.worker.stop()
+    telemetry.gpu.stop()
 
 
 @app.get("/")
@@ -329,7 +337,8 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
     Puts frames on `out` (None at the end). If the learner hangs up (`stop`), the voice stops at once, but the
     reply is still read to its end and saved, so the conversation stays consistent."""
     t0 = time.time()
-    st: dict = {"t": time.strftime("%H:%M:%S"), "streaming": live["chat"].streaming, "start": start}
+    tr = ctx["trace"]
+    st: dict = {"t": time.strftime("%H:%M:%S"), "streaming": live["chat"].streaming, "start": start, "trace": tr.id}
     sp = None
     order, locked = live["order"], False
     try:
@@ -337,26 +346,35 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
             msg = "[START]"
         else:
             if audio is not None:
-                heard = stt.transcribe(audio, "en")
+                with tr.span("turn.stt") as s_:
+                    heard = stt.transcribe(audio, "en", tr)
+                    s_.update(chars=len(heard["text"]), words=len(heard["words"]), audio_s=heard["duration"])
             else:
                 heard = {"text": text.strip(), "words": [], "duration": 0}
             st["stt_s"] = round(time.time() - t0, 3)
+            tr.mark("turn.heard", text=heard["text"], words=len(heard["words"]), audio_s=heard["duration"])
             if not heard["text"]:
                 out.put(_jframe({"type": "empty"}))
+                tr.metric(empty=True)
                 return
             m = metrics.turn_metrics(heard["words"]) if heard["words"] else None
         # Turns are saved in order: a learner who talks over the partner waits here until the reply being written
         # is complete (the voice of that reply was already silenced).
-        order.acquire()
+        with tr.span("turn.order_wait"):
+            order.acquire()
         locked = True
         if not start:
-            db.add_turn(sid, "user", heard["text"], heard["words"], m)
+            with tr.span("db.add_turn"):
+                db.add_turn(sid, "user", heard["text"], heard["words"], m)
             out.put(_jframe({"type": "user", "user": {"text": heard["text"], "words": heard["words"], "metrics": m}}))
             msg = metrics.marked_text(heard["words"], heard["text"])
 
-        engine = speech.engine_for()
+        with tr.span("voice.engine_for") as s_:
+            engine = speech.engine_for()
+            s_.update(engine=engine, worker=voices.worker.state, server=voices.worker.uses_server)
         st["engine"] = engine
-        sp = speech.Speech(engine, prompts.voice(live["voice"]), speed if engine == "kokoro" else 1.0)
+        tr.set(engine=engine)
+        sp = speech.Speech(engine, prompts.voice(live["voice"]), speed if engine == "kokoro" else 1.0, tr)
         ctx["sp"] = sp
         if ctx["stop"].is_set():
             sp.close()
@@ -376,7 +394,7 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
         seg = speech.Segmenter(speech.POLICY.get(engine, speech.POLICY["kokoro"]))
         t_llm, said = time.time(), ""
         try:
-            for delta in live["chat"].stream(msg):
+            for delta in live["chat"].stream(msg, tr):
                 if "llm_first_s" not in st:
                     st["llm_first_s"] = round(time.time() - t_llm, 3)
                 said += delta
@@ -385,6 +403,8 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
                     sp.add(piece)
         except Exception as e:  # noqa: BLE001
             sp.close()
+            tr.mark("llm.error", error=str(e)[:300])
+            tr.metric(error=f"Claude CLI error: {e}"[:300])
             out.put(_jframe({"type": "error", "message": f"Claude CLI error: {e}"}))
             return
         for piece in seg.flush():
@@ -392,7 +412,9 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
         sp.finish()
         st["llm_s"] = round(time.time() - t_llm, 3)
         said = said.strip()
-        db.add_turn(sid, "assistant", voices.clean(said))
+        tr.mark("turn.reply", text=said, chars=len(said))
+        with tr.span("db.add_turn"):
+            db.add_turn(sid, "assistant", voices.clean(said))
         order.release()
         locked = False
         out.put(_jframe({"type": "reply", "reply": voices.clean(said), "say": said}))
@@ -405,15 +427,20 @@ def _run_turn(live: dict, sid: int, out: "queue.Queue", audio: bytes | None, tex
         st["first_audio_s"] = round(fa + (sp._t0 - t0), 3) if fa is not None else None
         st["cancelled"] = sp.cancelled or ctx["stop"].is_set()
         out.put(_jframe({"type": "stats", "stats": st}))
+        tr.metric(stt_ms=_ms(st.get("stt_s")), llm_first_ms=_ms(st.get("llm_first_s")), llm_ms=_ms(st.get("llm_s")),
+                  server_first_audio_ms=_ms(st.get("first_audio_s")), audio_s=st.get("audio_s"),
+                  pieces=st.get("pieces"), rtf=st.get("rtf"), cancelled=st["cancelled"])
     except Exception as e:  # noqa: BLE001
         log.exception("turn failed")
         if sp:
             sp.close()
+        tr.metric(error=str(e)[:300])
         out.put(_jframe({"type": "error", "message": str(e)}))
     finally:
         if locked:
             order.release()
         out.put(None)
+        tr.finish()
 
 
 @app.post("/api/session/{sid}/turn/stream")
@@ -429,7 +456,11 @@ async def turn_stream(sid: int, request: Request, audio: UploadFile | None = Fil
     data = await audio.read() if audio is not None else None
     out: queue.Queue = queue.Queue()
     live["turns"] += 1
-    ctx = {"stop": threading.Event(), "sp": None, "id": live["turns"]}
+    tr = telemetry.start("turn", session=sid, turn=live["turns"], scenario=live["scenario"], persona=live["persona"],
+                         opening=start, speed=speed, voice=voice, audio_bytes=len(data) if data else 0,
+                         typed=bool(text) and data is None)
+    tr.mark("http.request", audio_bytes=len(data) if data else 0)
+    ctx = {"stop": threading.Event(), "sp": None, "id": live["turns"], "trace": tr}
     live["turn"] = ctx
     if not voice:  # the player speaks the reply itself afterwards (Orpheus at a speed far from 1x)
         ctx["stop"].set()
@@ -442,8 +473,12 @@ async def turn_stream(sid: int, request: Request, audio: UploadFile | None = Fil
                 # uvicorn doesn't fail the send when the browser hangs up: check, so an interrupted line stops
                 # generating right away instead of making the next turn wait behind it.
                 if await request.is_disconnected():
+                    tr.mark("http.client_disconnected")
                     break
+                tr.mark("http.sent", kind=item[:1].decode(), bytes=len(item))
                 yield item
+            else:
+                tr.mark("http.done")
         finally:
             ctx["stop"].set()
             if ctx["sp"] is not None:
@@ -456,7 +491,7 @@ async def turn_stream(sid: int, request: Request, audio: UploadFile | None = Fil
 
     return StreamingResponse(body(), media_type="application/octet-stream",
                              headers={"Cache-Control": "no-store", "X-Sample-Rate": str(speech.SR),
-                                      "X-Turn": str(ctx["id"])})
+                                      "X-Turn": str(ctx["id"]), "X-Trace": tr.id})
 
 
 @app.post("/api/session/{sid}/hush")
@@ -464,6 +499,8 @@ def hush(sid: int, turn: int = 0):
     """The learner started talking over the partner: stop the voice of that turn (`turn`, from the X-Turn header),
     but keep its text coming (the reply is still shown and saved)."""
     ctx = _live(sid).get("turn") or {}
+    if ctx.get("id") == turn and ctx.get("trace"):
+        ctx["trace"].mark("turn.hush")
     if ctx.get("id") == turn and ctx.get("sp") is not None:
         ctx["sp"].close()
     return {"ok": True}
@@ -560,12 +597,18 @@ class TTSReq(BaseModel):
 
 @app.post("/api/tts")
 async def speak(req: TTSReq):
+    tr = telemetry.start("tts", mode="wav", text=req.text, chars=len(req.text), voice=req.voice, speed=req.speed,
+                         engine=req.engine, cache=req.cache)
     try:
-        wav, meta = await run_in_threadpool(voices.synth, req.text, req.voice, max(0.6, min(1.4, req.speed)),
-                                            req.engine or None, req.cache)
+        with tr.span("tts.synth") as s_:
+            wav, meta = await run_in_threadpool(voices.synth, req.text, req.voice, max(0.6, min(1.4, req.speed)),
+                                                req.engine or None, req.cache)
+            s_.update(**meta, bytes=len(wav))
     except RuntimeError as e:
+        tr.finish(error=str(e)[:300])
         raise HTTPException(409, str(e)) from e
-    return Response(wav, media_type="audio/wav", headers={
+    tr.finish(engine=meta["engine"], cached=meta["cached"], audio_s=round(max(0, len(wav) - 44) / 48000, 2))
+    return Response(wav, media_type="audio/wav", headers={"X-Trace": tr.id, 
         "X-TTS-Engine": meta["engine"], "X-TTS-Speed": "native" if meta["speed_applied"] else "browser",
         "X-TTS-Fallback": "1" if meta["fallback"] else "", "X-TTS-Cached": "1" if meta["cached"] else ""})
 
@@ -584,21 +627,31 @@ async def speak_stream(req: StreamReq, request: Request):
     b"J" + u32 + {"type": "piece", "text"} before each spoken piece, b"P" + u32 length + PCM (s16le, mono,
     24 kHz), and b"E" + u32 0 after it. Closing the request (the learner interrupted) cancels what is left. With `cache`, a line already generated is
     sent from disk at once, and a new one is saved when it finishes."""
-    engine = await run_in_threadpool(speech.engine_for, req.engine or None)
+    tr = telemetry.start("tts", mode="stream", text=req.text, chars=len(req.text), voice=req.voice,
+                         speed=req.speed, engine=req.engine, cache=req.cache)
+    with tr.span("voice.engine_for") as s_:
+        engine = await run_in_threadpool(speech.engine_for, req.engine or None)
+        s_["engine"] = engine
+    tr.set(engine=engine)
     voice = prompts.voice(req.voice)
     speed = max(0.6, min(1.4, req.speed)) if engine == "kokoro" else 1.0
-    headers = {"X-TTS-Engine": engine, "X-Sample-Rate": str(speech.SR), "Cache-Control": "no-store"}
+    headers = {"X-TTS-Engine": engine, "X-Sample-Rate": str(speech.SR), "Cache-Control": "no-store",
+               "X-Trace": tr.id}
     media = "application/octet-stream"
     if req.cache:
-        pcm = await run_in_threadpool(voices.cached_pcm, engine, voice, req.text, speed)
+        with tr.span("tts.cache_lookup") as s_:
+            pcm = await run_in_threadpool(voices.cached_pcm, engine, voice, req.text, speed)
+            s_["hit"] = bool(pcm)
         if pcm:
+            tr.finish(cached=True, audio_s=round(len(pcm) / 48000, 2))
             return Response(_frame(b"P", pcm) + _frame(b"E"), media_type=media, headers={**headers, "X-TTS-Cached": "1"})
-    sp = speech.speak(req.text, engine, voice, speed)
+    sp = speech.speak(req.text, engine, voice, speed, tr)
     it = iter(sp)
     try:
         first = await run_in_threadpool(next, it, None)
     except RuntimeError as e:
         sp.close()
+        tr.finish(error=str(e)[:300])
         raise HTTPException(503, str(e)) from e
 
     async def body():
@@ -618,6 +671,9 @@ async def speak_stream(req: StreamReq, request: Request):
             complete = item is None and not sp.cancelled
         finally:
             sp.close()
+            tr.mark("http.done" if complete else "http.client_disconnected")
+            tr.finish(cached=False, complete=complete, audio_s=sp.stats["audio_s"], pieces=sp.stats["pieces"],
+                      server_first_audio_ms=_ms(sp.stats["first_audio_s"]))
             if req.cache and complete:
                 await run_in_threadpool(voices.save_pcm, engine, voice, req.text, b"".join(got), speed)
 
@@ -650,6 +706,61 @@ def voice_metrics():
                                              "rtf": med("rtf")}}
 
 
+# ---------- telemetry (see app/telemetry.py) ----------
+
+def _ms(seconds):
+    return round(seconds * 1000, 1) if isinstance(seconds, (int, float)) else None
+
+
+@app.get("/api/telemetry")
+def telemetry_list(limit: int = 200, kind: str = ""):
+    """Recent traces (newest first), without their events."""
+    return {"enabled": telemetry.ENABLED, "dir": str(telemetry.DIR), "traces": telemetry.listing(limit, kind)}
+
+
+@app.get("/api/telemetry/day/{day}")
+def telemetry_day(day: str):
+    """Every trace of a day (YYYY-MM-DD) with all its events, one JSON object per line, for analysis."""
+    folder = telemetry.DIR / day
+    if not (len(day) == 10 and folder.is_dir()):
+        raise HTTPException(404, "sem telemetria nesse dia")
+    lines = []
+    for f in sorted(folder.glob("*.json")):
+        try:
+            lines.append(f.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return Response("\n".join(lines) + "\n", media_type="application/x-ndjson",
+                    headers={"Content-Disposition": f'attachment; filename="telemetry-{day}.ndjson"'})
+
+
+@app.get("/api/telemetry/{tid}")
+def telemetry_get(tid: str):
+    t = telemetry.get(tid)
+    if not t:
+        raise HTTPException(404, "trace não encontrado")
+    return t
+
+
+class ClientTelemetryReq(BaseModel):
+    events: list[dict] = []
+    metrics: dict = {}
+    attrs: dict = {}
+
+
+@app.post("/api/telemetry/{tid}/client")
+def telemetry_client(tid: str, req: ClientTelemetryReq):
+    """The browser's side of a trace (recording, frames received, playback), merged into it."""
+    tr = telemetry.find(tid)
+    if tr is None:
+        raise HTTPException(404, "trace não está mais na memória")
+    tr.extend(req.events[:telemetry.MAX_EVENTS], "client")
+    tr.metric(**{k: v for k, v in req.metrics.items() if isinstance(v, (int, float, str, bool)) or v is None})
+    tr.set(**{k: v for k, v in req.attrs.items() if isinstance(v, (int, float, str, bool)) or v is None})
+    tr.save()
+    return {"ok": True}
+
+
 # ---------- voice engines (Kokoro neutral, Orpheus expressive) ----------
 
 @app.get("/api/voices")
@@ -679,8 +790,16 @@ def voices_use(req: UseReq):
 
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...), language: str = Form("en")):
-    heard = await run_in_threadpool(stt.transcribe, await audio.read(), language)
+    data = await audio.read()
+    tr = telemetry.start("transcribe", language=language, audio_bytes=len(data))
+    try:
+        heard = await run_in_threadpool(stt.transcribe, data, language, tr)
+    except Exception as e:
+        tr.finish(error=str(e)[:300])
+        raise
     heard["metrics"] = metrics.turn_metrics(heard["words"]) if heard["words"] else None
+    tr.finish(chars=len(heard["text"]), words=len(heard["words"]), audio_s=heard["duration"])
+    heard["trace"] = tr.id
     return heard
 
 
