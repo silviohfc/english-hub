@@ -47,6 +47,17 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def wipe() -> None:
+    """Erase all of the learner's data (used by the uninstall screen); the schema stays."""
+    with _lock:
+        tables = [r[0] for r in _conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for t in tables:
+            _conn.execute(f'DELETE FROM "{t}"')
+        _conn.commit()
+        _conn.execute("VACUUM")
+
+
 def _exec(sql: str, args: tuple = ()) -> sqlite3.Cursor:
     with _lock:
         cur = _conn.execute(sql, args)

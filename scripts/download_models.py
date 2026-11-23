@@ -29,10 +29,10 @@ def main() -> None:
     fetch(KOKORO_BASE + "kokoro-v1.0.onnx", config.KOKORO_MODEL)
     fetch(KOKORO_BASE + "voices-v1.0.bin", config.KOKORO_VOICES)
 
-    print(f"Whisper '{config.WHISPER_MODEL}' (download + GPU test)...")
+    print(f"Whisper '{config.WHISPER_MODEL}' (download + GPU test: CUDA or Apple MPS)...")
     from app.stt import stt
     stt.load()
-    print(f"ok   whisper {stt.model_name} on {stt.device}")
+    print(f"ok   whisper {stt.model_name} on {stt.device} ({stt.compute})")
     print("All models ready.")
 
 

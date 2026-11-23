@@ -8,16 +8,22 @@ web
 
 ## Users
 
-A Brazilian mid-level software developer with intermediate English whose main difficulty is speaking fluently
-under pressure. Practises alone at a desktop PC (Chrome/Edge, microphone, headphones), in short, frequent
-sessions whose length varies. The job: become confident and clearly understood in English conversations so they
-can land and keep an international (usually remote) developer job.
+Two audiences, chosen as a "track" in the app:
+
+- **Developer track (original):** a Brazilian mid-level software developer with intermediate English whose main
+  difficulty is speaking fluently under pressure. The job: become confident and clearly understood so they can
+  land and keep an international (usually remote) developer job.
+- **Everyday track:** a Brazilian adult with intermediate English who wants to handle everyday life in English
+  (travel, services, appointments, social conversations) without freezing.
+
+Both practise alone at a desk (Windows or Mac; Chrome, Edge or Safari; microphone, headphones), in short,
+frequent sessions whose length varies.
 
 ## Product Purpose
 
-dev-english is a local voice practice app. The learner talks out loud with AI role-play partners (recruiters,
+english-hub (formerly dev-english) is a local voice practice app. The learner talks out loud with AI role-play partners (recruiters,
 interviewers for real job postings, tech leads, PMs, teammates) and gets feedback after each conversation.
-Success means being understood easily and communicating clearly at work, not sounding native.
+Success means being understood easily and communicating clearly at work or in daily life, not sounding native.
 
 ## Positioning
 
@@ -27,8 +33,11 @@ Success means being understood easily and communicating clearly at work, not sou
 - Teaching method grounded in SLA research: partners never interrupt to correct (natural recasts only);
   feedback keeps to the few highest-impact issues for intelligibility; 4/3/2 retell drill; a mistake notebook
   and a phrase bank with spaced repetition that feed back into the next conversations.
+- Everyday track: daily-life classics (meeting someone, immigration, hotel, restaurant, doctor) and generated
+  everyday situations (wrong order, returns, customer-service calls, directions, pharmacy, landlord, plans).
 - Fully local and free: speech recognition (faster-whisper) and speech synthesis (Kokoro) on the user's GPU/CPU;
-  the LLM is the user's own Claude Code CLI subscription.
+  the LLM runs through the user's own plan via its CLI: Claude Code, Antigravity CLI (Gemini) or Codex CLI
+  (ChatGPT), chosen per role (conversation, feedback, helpers).
 
 ## Operating Context
 

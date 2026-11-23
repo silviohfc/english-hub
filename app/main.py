@@ -11,14 +11,24 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, db, llm, metrics, prompts
+from . import config, db, llm, metrics, prompts, providers, uninstall
+from . import setup as setup_mod
 from .stt import stt
 from .tts import tts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("app")
 
-app = FastAPI(title="dev-english")
+app = FastAPI(title="english-hub")
+
+
+@app.middleware("http")
+async def _no_stale_ui(request, call_next):
+    """The UI changes with every update: make the browser revalidate it instead of using a cached copy."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 STATIC = config.ROOT / "app" / "static"
 
 # Live conversations: session_id -> {"chat": ChatProcess, "scenario": str}
@@ -54,6 +64,30 @@ def scenario_info(sid: str) -> dict:
 
 @app.on_event("startup")
 def _warmup() -> None:
+    """Load models in the background when setup already ran and the files are on disk.
+    Otherwise the setup screen downloads and loads them with visible progress."""
+    def prewarm():
+        # Import the heavy libraries and read the hardware now, so the first screen doesn't wait on them.
+        try:
+            import faster_whisper.utils  # noqa: F401
+            import huggingface_hub  # noqa: F401
+            setup_mod.hardware()
+            setup_mod.models_state()
+            for pid in providers.PROVIDERS:
+                path = providers.resolve(pid)
+                if path:
+                    providers.version(pid, path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("prewarm failed: %s", e)
+    threading.Thread(target=prewarm, daemon=True).start()
+
+    if not config.current()["setup_done"]:
+        return
+    state = setup_mod.models_state()
+    if not (state["kokoro"] and all(state["whisper"].values())):
+        log.info("Models missing; waiting for the setup screen.")
+        return
+
     def load():
         for name, fn in (("stt", stt.load), ("tts", tts.load)):
             try:
@@ -79,14 +113,129 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.get("/api/status")
 def status():
-    return {"stt": stt.device and f"{stt.model_name} ({stt.device})", "tts": tts._k is not None,
-            "chat_model": config.CHAT_MODEL, "feedback_model": config.FEEDBACK_MODEL}
+    flags = config.current()
+    return {"stt": stt.device and f"{stt.model_name} ({stt.device}, {stt.compute})", "tts": tts._k is not None,
+            "chat_model": f"{config.CHAT_PROVIDER}:{config.CHAT_MODEL or 'padrão'}",
+            "feedback_model": f"{config.FEEDBACK_PROVIDER}:{config.FEEDBACK_MODEL or 'padrão'}",
+            "track": config.TRACK,
+            "setup_done": flags["setup_done"], "onboarding_done": flags["onboarding_done"],
+            "installing": setup_mod.job.running}
+
+
+# ---------- first-run setup & settings ----------
+@app.get("/api/setup")
+async def setup_overview():
+    return await run_in_threadpool(setup_mod.overview)
+
+
+@app.get("/api/setup/job")
+def setup_job():
+    return setup_mod.job.snapshot()
+
+
+class SettingsReq(BaseModel):
+    values: dict
+
+
+@app.post("/api/setup/settings")
+def save_settings(req: SettingsReq):
+    if setup_mod.job.running and any(k.startswith("whisper") for k in req.values):
+        raise HTTPException(409, "Espere a instalação terminar para trocar o modelo.")
+    try:
+        return config.apply(req.values)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, f"Valor inválido: {e}") from e
+
+
+@app.post("/api/setup/install")
+def setup_install():
+    setup_mod.job.start()
+    return setup_mod.job.snapshot()
+
+
+# ---------- AI providers (Claude Code, Antigravity, Codex): install, sign in, test ----------
+def _ai_overview() -> dict:
+    roles = {r: dict(zip(("provider", "model"), config.role(r))) for r in providers.ROLES}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(providers.PROVIDERS)) as pool:  # each state runs the CLI's own commands
+        states = list(pool.map(providers.state, providers.PROVIDERS))
+    return {"providers": states, "roles": roles,
+            "catalog": {pid: {"label": p["label"], "models": p["models"], "defaults": p["defaults"]}
+                        for pid, p in providers.PROVIDERS.items()},
+            "os": providers.system_label()}
+
+
+@app.get("/api/ai")
+async def ai_overview():
+    return await run_in_threadpool(_ai_overview)
+
+
+def _known(pid: str) -> None:
+    if pid not in providers.PROVIDERS:
+        raise HTTPException(404, "provedor desconhecido")
+
+
+@app.post("/api/ai/{pid}/install")
+def ai_install(pid: str):
+    _known(pid)
+    return providers.install(pid)
+
+
+@app.post("/api/ai/{pid}/login")
+def ai_login(pid: str):
+    _known(pid)
+    try:
+        return providers.login(pid)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, str(e)) from e
+
+
+@app.post("/api/ai/{pid}/logout")
+def ai_logout(pid: str):
+    _known(pid)
+    return providers.logout(pid)
+
+
+@app.post("/api/ai/{pid}/test")
+async def ai_test(pid: str):
+    _known(pid)
+    return await run_in_threadpool(llm.test, pid)
+
+
+@app.get("/api/ai/{pid}/task")
+def ai_task(pid: str):
+    _known(pid)
+    return providers.TASKS.get(pid) or {"status": "idle"}
+
+
+# ---------- uninstall ----------
+@app.get("/api/uninstall")
+async def uninstall_items():
+    return {"items": await run_in_threadpool(uninstall.items), "folder": str(config.ROOT)}
+
+
+class UninstallReq(BaseModel):
+    ids: list[str]
+
+
+@app.post("/api/uninstall")
+async def uninstall_run(req: UninstallReq):
+    for live in list(LIVE.values()):
+        live["chat"].close()
+    LIVE.clear()
+    return await run_in_threadpool(uninstall.run, req.ids)
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    uninstall.shutdown()
+    return {"ok": True}
 
 
 @app.get("/api/scenarios")
 def scenarios():
-    return [{"id": k, **{f: v[f] for f in ("title", "title_pt", "desc_pt", "persona", "voice")}}
-            for k, v in prompts.SCENARIOS.items()]
+    return [{"id": k, **{f: prompts.SCENARIOS[k][f] for f in ("title", "title_pt", "desc_pt", "persona", "voice")}}
+            for k in prompts.scenario_ids()]
 
 
 # ---------- conversation ----------
@@ -178,7 +327,7 @@ async def end_session(sid: int, req: EndReq | None = None):
     prompt = prompts.feedback_prompt(scn, "\n".join(lines), metrics.stats_text(sm),
                                      db.notebook(include_resolved=False), db.training_phrases())
     try:
-        report = await run_in_threadpool(llm.ask_json, prompt, prompts.FEEDBACK_SYSTEM, config.FEEDBACK_MODEL,
+        report = await run_in_threadpool(llm.ask_json, prompt, prompts.feedback_system(), "feedback",
                                          "", prompts.feedback_schema(scn))
     except Exception as e:  # noqa: BLE001
         db.finish_session(sid, sm, None)
@@ -252,7 +401,7 @@ class HelpReq(BaseModel):
 async def how_do_i_say(req: HelpReq):
     prompt = f"Conversation context (last line): {req.context}\nI want to say (Portuguese): {req.text}"
     try:
-        answer = await run_in_threadpool(llm.ask, prompt, prompts.HELPER_SYSTEM, config.HELPER_MODEL)
+        answer = await run_in_threadpool(llm.ask, prompt, prompts.helper_system(), "helper")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e)) from e
     return {"answer": answer}
@@ -276,7 +425,7 @@ async def retell(req: RetellReq):
     stats = metrics.stats_text(req.metrics or {})
     try:
         fb = await run_in_threadpool(llm.ask_json, prompts.retell_prompt(req.question, req.text, stats),
-                                     prompts.RETELL_SYSTEM, config.HELPER_MODEL)
+                                     prompts.retell_system(), "helper")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e)) from e
     return {"feedback": fb}
@@ -303,8 +452,8 @@ def put_profile(req: ProfileReq):
 
 @app.get("/api/situations")
 def situations():
-    return [{"id": k, "title_pt": v["title_pt"], "desc_pt": v["desc_pt"], "icon": v["icon"]}
-            for k, v in prompts.SITUATIONS.items()]
+    return [{"id": k, "title_pt": prompts.SITUATIONS[k]["title_pt"], "desc_pt": prompts.SITUATIONS[k]["desc_pt"],
+             "icon": prompts.SITUATIONS[k]["icon"]} for k in prompts.situation_ids()]
 
 
 def _clean_generated(data: dict) -> dict:
@@ -330,7 +479,7 @@ async def gen_situation(req: SituationReq):
     prompt = prompts.situation_prompt(req.kind, db.get_kv("profile"), req.pressure)
     try:
         data = _clean_generated(await run_in_threadpool(
-            llm.ask_json, prompt, prompts.GEN_SYSTEM, config.FEEDBACK_MODEL, "", prompts.SCENARIO_SCHEMA))
+            llm.ask_json, prompt, prompts.gen_system(), "feedback", "", prompts.SCENARIO_SCHEMA))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Falha ao gerar cenário: {e}") from e
     data["source"] = {"type": "situation", "kind": req.kind, "pressure": req.pressure,
@@ -346,7 +495,7 @@ class JobSearchReq(BaseModel):
 async def job_search(req: JobSearchReq):
     prompt = prompts.job_search_prompt(req.query, db.get_kv("profile"))
     try:
-        data = await run_in_threadpool(llm.ask_json, prompt, prompts.JOB_SEARCH_SYSTEM, config.FEEDBACK_MODEL,
+        data = await run_in_threadpool(llm.ask_json, prompt, prompts.JOB_SEARCH_SYSTEM, "feedback",
                                        llm.WEB_TOOLS, prompts.JOBS_SCHEMA)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Falha na busca: {e}") from e
@@ -373,8 +522,8 @@ async def gen_job(req: JobScenarioReq):
     tools = "WebFetch" if isinstance(job, str) and "http" in job else ""
     prompt = prompts.job_scenario_prompt(job, db.get_kv("profile"), req.stage)
     try:
-        data = _clean_generated(await run_in_threadpool(llm.ask_json, prompt, prompts.GEN_SYSTEM,
-                                                        config.FEEDBACK_MODEL, tools, prompts.SCENARIO_SCHEMA))
+        data = _clean_generated(await run_in_threadpool(llm.ask_json, prompt, prompts.gen_system(),
+                                                        "feedback", tools, prompts.SCENARIO_SCHEMA))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Falha ao gerar entrevista: {e}") from e
     src = req.job or {}
@@ -434,7 +583,7 @@ async def add_phrase(req: PhraseReq):
     if not meaning or not example:  # let the model clean the phrase and explain it
         try:
             info = await run_in_threadpool(llm.ask_json, prompts.phrase_enrich_prompt(text, req.context),
-                                           prompts.PHRASE_SYSTEM, config.HELPER_MODEL, "", prompts.PHRASE_SCHEMA)
+                                           prompts.phrase_system(), "helper", "", prompts.PHRASE_SCHEMA)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"Falha ao explicar a frase: {e}") from e
         if existing := db.find_phrase(info.get("text") or text):
@@ -469,7 +618,7 @@ async def review(pid: int, req: PhraseReviewReq):
     if req.sentence.strip():
         try:
             result = await run_in_threadpool(llm.ask_json, prompts.phrase_use_prompt(p, req.sentence),
-                                             prompts.PHRASE_SYSTEM, config.HELPER_MODEL, "", prompts.PHRASE_USE_SCHEMA)
+                                             prompts.phrase_system(), "helper", "", prompts.PHRASE_USE_SCHEMA)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, str(e)) from e
     updated = db.review_phrase(pid, bool(req.recall_ok and result.get("used_correctly")))
@@ -480,7 +629,7 @@ async def review(pid: int, req: PhraseReviewReq):
 
 @app.get("/api/packs")
 def packs():
-    return [{"id": k, "icon": v["icon"], "title_pt": v["title_pt"]} for k, v in prompts.PACKS.items()]
+    return [{"id": k, "icon": prompts.PACKS[k]["icon"], "title_pt": prompts.PACKS[k]["title_pt"]} for k in prompts.pack_ids()]
 
 
 class PackReq(BaseModel):
@@ -504,7 +653,7 @@ async def gen_pack(req: PackReq):
     known = [p["text"] for p in db.list_phrases()]
     prompt = prompts.pack_prompt(theme, db.get_kv("profile"), known, db.watch_items(10))
     try:
-        data = await run_in_threadpool(llm.ask_json, prompt, prompts.PHRASE_SYSTEM, config.FEEDBACK_MODEL, "",
+        data = await run_in_threadpool(llm.ask_json, prompt, prompts.phrase_system(), "feedback", "",
                                        prompts.PACK_SCHEMA)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Falha ao gerar pacote: {e}") from e
@@ -528,7 +677,14 @@ def add_bulk(req: BulkReq):
 
 
 def run() -> None:
+    import webbrowser
+
     import uvicorn
+    url = f"http://{config.HOST}:{config.PORT}"
+    if config._env("NO_BROWSER") != "1":
+        # Open the browser once the server is accepting connections (setup screen on first run).
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+    print(f"\n  english-hub rodando em {url}  (feche esta janela para encerrar)\n", flush=True)
     uvicorn.run(app, host=config.HOST, port=config.PORT)
 
 
